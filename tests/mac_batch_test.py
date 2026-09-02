@@ -250,6 +250,158 @@ def test_list_tasks_batches():
     check("result parsed", len(result) == 1 and result[0]["subject"] == "Pay invoice")
 
 
+def test_text_to_html_conversion():
+    log("--- text_to_html: paragraphs, line breaks, entity escaping ---")
+    from outlook_desktop_mcp.utils.applescript_helpers import text_to_html
+
+    html = text_to_html("Hi team,\n\nSee <config> & \"notes\".\nSecond line\n\nRegards,\nAlex")
+    check("blank line becomes paragraph, single newline becomes <br>",
+          html == ("<p>Hi team,</p>"
+                   "<p>See &lt;config&gt; &amp; \"notes\".<br>Second line</p>"
+                   "<p>Regards,<br>Alex</p>"), html)
+    check("no raw newlines survive", "\n" not in html)
+    check("CRLF normalised", text_to_html("a\r\n\r\nb") == "<p>a</p><p>b</p>", text_to_html("a\r\n\r\nb"))
+    check("runs of blank lines collapse to one paragraph break",
+          text_to_html("a\n\n\n\nb") == "<p>a</p><p>b</p>", text_to_html("a\n\n\n\nb"))
+    check("empty input stays empty", text_to_html("") == "")
+    check("unicode preserved", text_to_html("It\u2019s \u2014 caf\u00e9") == "<p>It\u2019s \u2014 caf\u00e9</p>")
+
+
+def test_send_email_plain_body_becomes_html():
+    log("--- send_email converts plain body to HTML so newlines survive ---")
+    fake = FakeBridge(output="")
+    server_mac.bridge = fake
+
+    asyncio.run(server_mac.send_email(
+        to="a@b.com", subject="Hi", body="Line one\n\nLine two\nLine three"))
+    script = fake.scripts[0]
+    check("content is HTML paragraphs",
+          'content:"<p>Line one</p><p>Line two<br>Line three</p>"' in script, script)
+    check("no escaped raw newlines in content", "\\n" not in script)
+    check("html content property never used", "html content" not in script)
+
+
+def test_send_email_html_body_uses_content_property():
+    log("--- send_email html_body goes into content (html content is not a valid property) ---")
+    fake = FakeBridge(output="")
+    server_mac.bridge = fake
+
+    html = '<p>Hi \u2014 caf\u00e9,</p><table border="1"><tr><td><a href="https://x.y/K-1">K-1</a></td></tr></table>'
+    result = asyncio.run(server_mac.send_email(
+        to="a@b.com", subject="Hi", body="fallback", html_body=html))
+    script = fake.scripts[0]
+    check("html content property never used", "html content" not in script)
+    check("html placed in content with quotes escaped",
+          'content:"<p>Hi \u2014 caf\u00e9,</p><table border=\\"1\\"><tr><td><a href=\\"https://x.y/K-1\\">K-1</a></td></tr></table>"' in script,
+          script)
+    check("plain body not sent when html given", "fallback" not in script)
+    check("success message", result.startswith("Email sent"), result)
+
+
+def test_send_email_escapes_backslash_and_quotes_in_subject():
+    log("--- send_email escapes AppleScript-special characters ---")
+    fake = FakeBridge(output="")
+    server_mac.bridge = fake
+
+    asyncio.run(server_mac.send_email(
+        to="a@b.com", subject='Re: "path\\file"', body="x"))
+    script = fake.scripts[0]
+    check("subject escaped", 'subject:"Re: \\"path\\\\file\\""' in script, script)
+
+
+def test_reply_email_inserts_html_after_body_tag():
+    log("--- reply_email inserts HTML reply inside quoted-thread body ---")
+    fake = FakeBridge(output="Re: thing")
+    server_mac.bridge = fake
+
+    result = asyncio.run(server_mac.reply_email(
+        entry_id="42", body="Thanks.\n\nRegards,\nAlex", reply_all=True))
+    script = fake.scripts[0]
+    check("reply all command", "reply all to m" in script)
+    check("original content read back", "set origContent to content of replyMsg" in script)
+    check("plain body converted to HTML",
+          'set replyHtml to "<p>Thanks.</p><p>Regards,<br>Alex</p>"' in script, script)
+    check("insertion after <body", 'offset of "<body" in origContent' in script)
+    check("prepend fallback when no body tag", "replyHtml & origContent" in script)
+    check("no return-char joining", "& return & return &" not in script)
+    check("reply sent", "send replyMsg" in script)
+    check("result reports subject", "Re: thing" in result, result)
+
+    fake = FakeBridge(output="Re: thing")
+    server_mac.bridge = fake
+    asyncio.run(server_mac.reply_email(entry_id="42", body="ignored", html_body="<p><strong>Done</strong></p>"))
+    script = fake.scripts[0]
+    check("html_body used verbatim", 'set replyHtml to "<p><strong>Done</strong></p>"' in script, script)
+    check("plain body dropped when html given", "ignored" not in script)
+
+
+def _has_components(script, var, year, month, day, secs):
+    return (f"set year of {var} to {year}" in script
+            and f"set month of {var} to {month}" in script
+            and f"set day of {var} to {day}" in script
+            and f"set time of {var} to {secs}" in script)
+
+
+def test_create_event_uses_date_components():
+    log("--- create_event builds dates from components, not date literals ---")
+    fake = FakeBridge(output=DELIM.join(["9", "Standup", "x", "y"]))
+    server_mac.bridge = fake
+
+    result = json.loads(asyncio.run(server_mac.create_event(
+        subject="Standup", start="2026-09-01 07:00", end="2026-09-01T07:30:00")))
+    script = fake.scripts[0]
+    check("no date literal", 'date "' not in script, script)
+    check("start components", _has_components(script, "startDT", 2026, 9, 1, 7 * 3600), script)
+    check("end components", _has_components(script, "endDT", 2026, 9, 1, 7 * 3600 + 1800), script)
+    check("properties reference variables", "start time:startDT, end time:endDT" in script, script)
+    check("result parsed", result["entry_id"] == "9" and result["status"] == "created", str(result))
+
+
+def test_create_meeting_uses_date_components():
+    log("--- create_meeting builds dates from components ---")
+    fake = FakeBridge(output="9")
+    server_mac.bridge = fake
+
+    asyncio.run(server_mac.create_meeting(
+        subject="Sync", start="2026-12-24 15:45", end="2026-12-24 16:00",
+        required_attendees="a@b.com; c@d.com"))
+    script = fake.scripts[0]
+    check("no date literal", 'date "' not in script, script)
+    check("start components", _has_components(script, "startDT", 2026, 12, 24, 15 * 3600 + 45 * 60), script)
+    check("end components", _has_components(script, "endDT", 2026, 12, 24, 16 * 3600), script)
+    check("attendees added", script.count("make new required attendee") == 2)
+
+
+def test_update_event_uses_date_components():
+    log("--- update_event builds dates from components ---")
+    fake = FakeBridge(output=DELIM.join(["9", "S", "x", "y", "Room"]))
+    server_mac.bridge = fake
+
+    asyncio.run(server_mac.update_event(entry_id="9", start="2026-03-05 09:00"))
+    script = fake.scripts[0]
+    check("no date literal", 'date "' not in script, script)
+    check("start components", _has_components(script, "startDT", 2026, 3, 5, 9 * 3600), script)
+    check("start assigned from variable", "set start time of e to startDT" in script, script)
+    check("end untouched when not given", "endDT" not in script)
+
+    fake = FakeBridge(output=DELIM.join(["9", "S", "x", "y", "Room"]))
+    server_mac.bridge = fake
+    asyncio.run(server_mac.update_event(entry_id="9", end="2026-03-05 10:00"))
+    check("end assigned from variable", "set end time of e to endDT" in fake.scripts[0], fake.scripts[0])
+
+
+def test_create_task_uses_date_components():
+    log("--- create_task builds due date from components ---")
+    fake = FakeBridge(output="5")
+    server_mac.bridge = fake
+
+    asyncio.run(server_mac.create_task(subject="Pay", due_date="2026-09-30"))
+    script = fake.scripts[0]
+    check("no date literal", 'date "' not in script, script)
+    check("due components", _has_components(script, "dueDT", 2026, 9, 30, 0), script)
+    check("due assigned from variable", "due date:dueDT" in script, script)
+
+
 def test_script_timeout_env_override():
     log("--- SCRIPT_TIMEOUT honors OUTLOOK_MCP_SCRIPT_TIMEOUT env var ---")
     import importlib
@@ -279,6 +431,15 @@ def main():
     test_list_folders_batches_names()
     test_list_folders_depth_and_legacy()
     test_list_tasks_batches()
+    test_text_to_html_conversion()
+    test_send_email_plain_body_becomes_html()
+    test_send_email_html_body_uses_content_property()
+    test_send_email_escapes_backslash_and_quotes_in_subject()
+    test_reply_email_inserts_html_after_body_tag()
+    test_create_event_uses_date_components()
+    test_create_meeting_uses_date_components()
+    test_update_event_uses_date_components()
+    test_create_task_uses_date_components()
     test_script_timeout_env_override()
 
     log("=" * 50)

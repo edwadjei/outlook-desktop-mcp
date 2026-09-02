@@ -1,4 +1,5 @@
 """Helpers for building and parsing AppleScript safely."""
+import html
 import re
 from datetime import datetime
 
@@ -16,14 +17,21 @@ def escape(text: str) -> str:
     return text
 
 
-def format_date(dt: datetime) -> str:
-    """Convert a Python datetime to an AppleScript date string.
+def text_to_html(text: str) -> str:
+    """Convert plain text to minimal HTML for an Outlook message body.
 
-    Returns a string like: date "Sunday, March 22, 2026 at 2:00:00 PM"
-    AppleScript parses dates based on the system locale, so we use a
-    locale-friendly format that osascript can interpret.
+    Outlook treats the `content` property of messages as HTML, so literal
+    newlines collapse to whitespace. Blank lines become paragraph breaks,
+    single newlines become <br>, and &, <, > are entity-escaped.
     """
-    return f'date "{dt.strftime("%Y-%m-%d %H:%M:%S")}"'
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not text:
+        return ""
+    paragraphs = re.split(r"\n{2,}", text)
+    return "".join(
+        "<p>" + html.escape(p, quote=False).replace("\n", "<br>") + "</p>"
+        for p in paragraphs
+    )
 
 
 def parse_date(text: str) -> str:

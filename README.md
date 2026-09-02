@@ -113,11 +113,11 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
-| `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
+| `send_email` | yes | yes | Send an email with To/CC/BCC; `html_body` recommended, plain `body` auto-converted to HTML |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
 | `search_emails` | yes | yes | Full-text search across email subjects and bodies |
-| `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
+| `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread; accepts `html_body` |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
 | `move_email` | yes | yes | Move an email to Archive, Trash, or any folder |
@@ -204,6 +204,19 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 - Folder references use AppleScript's **locale-independent keywords** (`inbox`, `sent items`, `drafts`, `deleted items`) rather than localized folder names.
 - Search uses AppleScript's `whose` clause (e.g. `messages whose subject contains "query"`) instead of DASL filters.
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
+- Dates passed to AppleScript are built by component assignment (`set year of d to 2026`, ...) rather than `date "..."` literals, which osascript parses according to the system locale and can silently turn `"2026-09-01 07:00"` into a date in 2007.
+
+#### Email bodies on macOS
+
+Outlook's AppleScript `content` property is **HTML**. A body set with literal newlines is delivered as one run-on line, because the newlines are just HTML whitespace. The server therefore treats every body as HTML:
+
+- **`html_body` (recommended)** for `send_email` and `reply_email`: pass an HTML fragment. `<p>`, `<br>`, `<strong>`, `<a href>`, and `<table border="1">` all render for recipients in Outlook desktop and OWA. Quotes, backslashes, and non-ASCII characters are escaped for AppleScript automatically; do not pre-escape.
+- **Plain `body`** is converted server-side: `&`, `<`, `>` are entity-escaped, blank lines become `<p>` paragraphs, and single newlines become `<br>`. It is ignored when `html_body` is given.
+- **Replies** insert the reply HTML immediately inside the `<body>` of Outlook's quoted-thread draft, so the original message and thread headers stay intact below the reply.
+- **Outlook adds no signature.** AppleScript-created messages bypass Outlook's compose window, which is where client signatures are inserted; the Sent Items copy contains exactly the HTML you passed. A signature configured under Outlook > Preferences > Signatures is therefore never appended (and never duplicated). Include the sign-off (e.g. `<p>Regards,<br>Alex</p>`) in the body itself.
+- **The mail server may add one anyway.** On an Exchange tenant with a transport-rule signature (common in corporate tenants), the corporate signature and disclaimer block is appended in transit and shows up only in the *received* copy, directly after your closing. Do not embed a full signature block in the body or recipients will see it twice.
+
+`python tests/manual_send_test.py you@example.com` sends one HTML email and one plain-body email to the given address exercising paragraphs, bold, a clickable link column, and a bordered table, then reads the Sent Items copy back and reports whether anything was appended.
 
 ## Install from Source
 

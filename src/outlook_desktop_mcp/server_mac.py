@@ -19,8 +19,8 @@ from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
 from outlook_desktop_mcp.utils.applescript_helpers import (
     date_component_lines,
     escape,
-    format_date,
     parse_date,
+    text_to_html,
     resolve_folder_ref,
     DELIM,
     RECORD_DELIM,
@@ -253,16 +253,26 @@ async def send_email(
     Creates and sends an email immediately through the default Outlook profile.
     The email will appear in the user's Sent Items folder after sending.
 
+    Outlook renders message bodies as HTML. Prefer html_body for anything
+    with structure (paragraphs, bold, links, tables). A plain body is
+    converted server-side: blank lines become paragraphs, single newlines
+    become line breaks, and &, <, > are escaped.
+
+    Outlook adds no signature to AppleScript-created messages (they bypass
+    the compose window). A corporate signature/disclaimer may still be
+    appended by the mail server in transit, so include only a short
+    sign-off in the body and never a full signature block.
+
     Args:
         to: One or more recipient email addresses, separated by semicolons.
             Example: "alice@example.com" or "alice@example.com; bob@example.com"
         subject: The email subject line.
-        body: The plain-text body of the email. If html_body is also provided,
-            both are set and Outlook will prefer the HTML version.
+        body: Plain-text body. Ignored when html_body is provided.
         cc: Optional. CC recipients, separated by semicolons.
         bcc: Optional. BCC recipients, separated by semicolons.
-        html_body: Optional. HTML-formatted body. When provided, Outlook renders
-            the email as HTML. The plain-text body serves as fallback.
+        html_body: Recommended. HTML body fragment, e.g.
+            "<p>Hi Ama,</p><p>Kindly confirm ... </p><p>Regards,<br>Alex</p>".
+            <strong>, <a href>, and <table border="1"> render for recipients.
 
     Returns:
         A confirmation message with subject and recipients, or an error.
@@ -280,10 +290,10 @@ async def send_email(
     cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
     bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
 
-    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+    content = html_body if html_body else text_to_html(body)
 
     script = f'''tell application "Microsoft Outlook"
-    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", {content_prop}}}
+    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", content:"{escape(content)}"}}
     {to_lines}{cc_lines}{bcc_lines}
     send newMsg
 end tell'''
@@ -705,28 +715,52 @@ async def reply_email(
     entry_id: str,
     body: str,
     reply_all: bool = False,
+    html_body: str = "",
 ) -> str:
     """Reply to an email in Outlook.
 
-    Creates and sends a reply, preserving the original message thread.
-    Use reply_all=True to reply to all recipients (sender + CC list).
+    Creates and sends a reply, preserving the original message thread. The
+    reply text is inserted above Outlook's quoted original. Bodies are
+    HTML (see send_email): prefer html_body for structured content; a plain
+    body is converted so paragraphs and line breaks survive. Signature
+    handling is the same as send_email (none added by Outlook).
 
     Args:
         entry_id: The numeric ID of the email to reply to.
-        body: The reply message text. Prepended above the original message
-            in the email thread.
+        body: Plain-text reply. Ignored when html_body is provided.
         reply_all: If true, reply to all recipients (sender + all CC/To).
             If false (default), reply only to the sender.
+        html_body: Recommended. HTML fragment for the reply text.
 
     Returns:
         Confirmation indicating the reply was sent, or an error.
     """
     reply_cmd = "reply all to" if reply_all else "reply to"
+    reply_html = html_body if html_body else text_to_html(body)
+    # Outlook's reply draft is a full <html><body>...</body></html> document
+    # holding the quoted thread; the reply must go inside <body>, not in
+    # front of the document.
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set msubject to subject of m
-    set replyMsg to {reply_cmd} m
-    set content of replyMsg to "{escape(body)}" & return & return & content of replyMsg
+    set replyMsg to {reply_cmd} m without opening window
+    set origContent to content of replyMsg
+end tell
+set replyHtml to "{escape(reply_html)}"
+set bodyStart to offset of "<body" in origContent
+if bodyStart > 0 then
+    set tagClose to offset of ">" in (text bodyStart thru -1 of origContent)
+    set insertAt to bodyStart + tagClose - 1
+    if insertAt < (length of origContent) then
+        set newContent to (text 1 thru insertAt of origContent) & replyHtml & (text (insertAt + 1) thru -1 of origContent)
+    else
+        set newContent to origContent & replyHtml
+    end if
+else
+    set newContent to replyHtml & origContent
+end if
+tell application "Microsoft Outlook"
+    set content of replyMsg to newContent
     send replyMsg
     return msubject
 end tell'''
@@ -1321,7 +1355,7 @@ async def create_event(
     start_dt = datetime.fromisoformat(start)
     end_dt = datetime.fromisoformat(end)
 
-    props = f'subject:"{escape(subject)}", start time:{format_date(start_dt)}, end time:{format_date(end_dt)}'
+    props = f'subject:"{escape(subject)}", start time:startDT, end time:endDT'
     if location:
         props += f', location:"{escape(location)}"'
     if body:
@@ -1329,7 +1363,9 @@ async def create_event(
     if all_day:
         props += ', all day flag:true'
 
-    script = f'''tell application "Microsoft Outlook"
+    script = f'''{date_component_lines("startDT", start_dt)}
+{date_component_lines("endDT", end_dt)}
+tell application "Microsoft Outlook"
     set newEvt to make new calendar event with properties {{{props}}}
     return (id of newEvt as text) & "{DELIM}" & (subject of newEvt) & "{DELIM}" & (start time of newEvt as string) & "{DELIM}" & (end time of newEvt as string)
 end tell'''
@@ -1386,7 +1422,7 @@ async def create_meeting(
     start_dt = datetime.fromisoformat(start)
     end_dt = datetime.fromisoformat(end)
 
-    props = f'subject:"{escape(subject)}", start time:{format_date(start_dt)}, end time:{format_date(end_dt)}'
+    props = f'subject:"{escape(subject)}", start time:startDT, end time:endDT'
     if location:
         props += f', location:"{escape(location)}"'
     if body:
@@ -1403,7 +1439,9 @@ async def create_meeting(
             if addr:
                 attendee_lines += f'make new optional attendee at newEvt with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
 
-    script = f'''tell application "Microsoft Outlook"
+    script = f'''{date_component_lines("startDT", start_dt)}
+{date_component_lines("endDT", end_dt)}
+tell application "Microsoft Outlook"
     set newEvt to make new calendar event with properties {{{props}}}
     {attendee_lines}
     return (id of newEvt as text)
@@ -1446,14 +1484,15 @@ async def update_event(
         Confirmation with updated event details, or an error.
     """
     set_lines = ""
+    date_lines = ""
     if subject:
         set_lines += f'set subject of e to "{escape(subject)}"\n'
     if start:
-        start_dt = datetime.fromisoformat(start)
-        set_lines += f'set start time of e to {format_date(start_dt)}\n'
+        date_lines += date_component_lines("startDT", datetime.fromisoformat(start)) + "\n"
+        set_lines += 'set start time of e to startDT\n'
     if end:
-        end_dt = datetime.fromisoformat(end)
-        set_lines += f'set end time of e to {format_date(end_dt)}\n'
+        date_lines += date_component_lines("endDT", datetime.fromisoformat(end)) + "\n"
+        set_lines += 'set end time of e to endDT\n'
     if location:
         set_lines += f'set location of e to "{escape(location)}"\n'
     if body:
@@ -1462,7 +1501,7 @@ async def update_event(
     if not set_lines:
         return json.dumps({"error": "No fields to update"})
 
-    script = f'''tell application "Microsoft Outlook"
+    script = f'''{date_lines}tell application "Microsoft Outlook"
     set e to calendar event id {entry_id}
     {set_lines}
     return (id of e as text) & "{DELIM}" & (subject of e) & "{DELIM}" & (start time of e as string) & "{DELIM}" & (end time of e as string) & "{DELIM}" & (location of e)
@@ -1831,13 +1870,14 @@ async def create_task(
     imp_val = imp_map.get(importance.lower(), "priority normal")
 
     props = f'name:"{escape(subject)}", priority:{imp_val}'
+    date_lines = ""
     if due_date:
-        due_dt = datetime.fromisoformat(due_date)
-        props += f', due date:{format_date(due_dt)}'
+        date_lines = date_component_lines("dueDT", datetime.fromisoformat(due_date)) + "\n"
+        props += ', due date:dueDT'
     if body:
         props += f', content:"{escape(body)}"'
 
-    script = f'''tell application "Microsoft Outlook"
+    script = f'''{date_lines}tell application "Microsoft Outlook"
     set newTask to make new task with properties {{{props}}}
     return (id of newTask as text) & "{DELIM}" & (name of newTask)
 end tell'''
