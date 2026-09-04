@@ -491,12 +491,11 @@ end tell'''
         set mid to id of m
         set msubject to subject of m
         set msender to ""
-        try
-            set msender to address of sender of m
-        end try
         set msenderName to ""
         try
-            set msenderName to name of sender of m
+            set senderRec to sender of m
+            set msender to address of senderRec
+            set msenderName to name of senderRec
         end try
         set mtime to time received of m as string
         set misread to is read of m
@@ -1107,12 +1106,11 @@ end tell'''
         set mid to id of m
         set msubject to subject of m
         set msender to ""
-        try
-            set msender to address of sender of m
-        end try
         set msenderName to ""
         try
-            set msenderName to name of sender of m
+            set senderRec to sender of m
+            set msender to address of senderRec
+            set msenderName to name of senderRec
         end try
         set mtime to time received of m as string
         set misread to is read of m
@@ -1389,7 +1387,8 @@ async def get_event(entry_id: str) -> str:
     try
         set attList to attendees of e
         repeat with a in attList
-            set eattendees to eattendees & address of a & "; "
+            set ea to email address of a
+            set eattendees to eattendees & (address of ea) & "; "
         end repeat
     end try
     return (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & ebody & "{DELIM}" & eattendees

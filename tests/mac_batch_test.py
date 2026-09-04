@@ -448,6 +448,57 @@ def test_read_email_extracts_sender_and_recipients():
         check(f"{label}: sender parsed", result.get("sender") == "a@b.com", str(result))
 
 
+def _check_legacy_sender_shape(label, script):
+    check(f"{label}: legacy sender record stored before reading address",
+          "set senderRec to sender of m" in script
+          and "set msender to address of senderRec" in script
+          and "set msenderName to name of senderRec" in script)
+    check(f"{label}: legacy script has no chained sender specifier",
+          "address of sender of m" not in script
+          and "name of sender of m" not in script)
+
+
+def test_list_emails_legacy_reads_sender_via_variable():
+    log("--- list_emails legacy fallback reads sender via local variable ---")
+    fake = FakeBridge(output=email_record() + RECORD_DELIM,
+                      fail_first_with="Microsoft Outlook got an error: boom")
+    server_mac.bridge = fake
+    result = json.loads(asyncio.run(server_mac.list_emails(folder="inbox", count=5)))
+    check("legacy fallback ran", len(fake.scripts) == 2)
+    if len(fake.scripts) == 2:
+        _check_legacy_sender_shape("list_emails", fake.scripts[1])
+    check("sender parsed", result and result[0]["sender"] == "a@b.com", str(result))
+
+
+def test_search_emails_legacy_reads_sender_via_variable():
+    log("--- search_emails legacy fallback reads sender via local variable ---")
+    fake = FakeBridge(output=email_record() + RECORD_DELIM,
+                      fail_first_with="Microsoft Outlook got an error: boom")
+    server_mac.bridge = fake
+    result = json.loads(asyncio.run(server_mac.search_emails(query="Hello", count=5)))
+    check("legacy fallback ran", len(fake.scripts) == 2)
+    if len(fake.scripts) == 2:
+        _check_legacy_sender_shape("search_emails", fake.scripts[1])
+    check("sender parsed", result and result[0]["sender"] == "a@b.com", str(result))
+
+
+def test_get_event_reads_attendee_address_via_variable():
+    log("--- get_event reads attendee address from email address record ---")
+    record = DELIM.join([
+        "7", "Standup", "2026-09-04 09:00:00", "2026-09-04 09:30:00",
+        "Room 1", "org@b.com", "false", "body", "x@b.com; y@b.com; ",
+    ])
+    fake = FakeBridge(output=record)
+    server_mac.bridge = fake
+    result = json.loads(asyncio.run(server_mac.get_event(entry_id="7")))
+    script = fake.scripts[0]
+    check("attendee email address record stored",
+          "set ea to email address of a" in script
+          and "address of ea" in script)
+    check("no direct address of attendee", "address of a &" not in script)
+    check("attendees parsed", result.get("attendees") == "x@b.com; y@b.com;", str(result))
+
+
 def main():
     test_list_emails_uses_batch_script()
     test_list_emails_unread_uses_whose_filter()
@@ -471,6 +522,9 @@ def main():
     test_create_task_uses_date_components()
     test_script_timeout_env_override()
     test_read_email_extracts_sender_and_recipients()
+    test_list_emails_legacy_reads_sender_via_variable()
+    test_search_emails_legacy_reads_sender_via_variable()
+    test_get_event_reads_attendee_address_via_variable()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")
