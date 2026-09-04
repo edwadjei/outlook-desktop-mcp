@@ -8,6 +8,7 @@ Just run this on macOS with Outlook open and you have a full email MCP server.
 Entry point: python -m outlook_desktop_mcp (auto-detected on macOS)
 """
 import sys
+import asyncio
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
+from outlook_desktop_mcp import outlook_db
+from outlook_desktop_mcp.outlook_db import OutlookDB, OutlookDBError
 from outlook_desktop_mcp.utils.applescript_helpers import (
     date_component_lines,
     escape,
@@ -63,6 +66,80 @@ mcp = FastMCP(
 )
 
 bridge = AppleScriptBridge()
+
+# Read-only handle on legacy Outlook's profile database, set at startup
+# once _trust_db() has confirmed it is the store AppleScript is reading.
+# None means every tool uses AppleScript only.
+db: OutlookDB | None = None
+
+# Startup trust check: the database inbox count may differ from
+# AppleScript's by this much (mail arriving while we check) and still be
+# trusted. A stale database left behind by a switch to New Outlook drifts
+# far beyond this.
+_TRUST_DRIFT_MIN = 50
+_TRUST_DRIFT_FRACTION = 0.02
+
+
+async def _db_folder_id(folder: str) -> int | None:
+    """Resolve a folder name via the profile database, or None if unavailable."""
+    if db is None:
+        return None
+    try:
+        return await asyncio.to_thread(db.resolve_folder, folder)
+    except OutlookDBError as e:
+        logger.warning("Outlook database folder lookup failed; using AppleScript: %s", e)
+        return None
+
+
+async def _folder_ref(folder: str) -> str:
+    """AppleScript folder reference for a user-facing folder name.
+
+    Prefers `mail folder id N` from the database, which reaches the real
+    Exchange folder; AppleScript's `inbox` keyword resolves to the empty
+    local "On My Computer" store on Exchange-backed profiles.
+    """
+    fid = await _db_folder_id(folder)
+    if fid is not None:
+        return f"mail folder id {fid}"
+    return resolve_folder_ref(folder)
+
+
+async def _trust_db(candidate: OutlookDB) -> bool:
+    """Confirm the database is the live store behind AppleScript.
+
+    Asks AppleScript for the message count of the folder the database calls
+    the inbox. If AppleScript cannot resolve that id, or the counts diverge
+    beyond a small drift, the database is stale (e.g. New Outlook mode) and
+    must not be used.
+    """
+    try:
+        probe = await asyncio.to_thread(candidate.inbox_probe)
+    except OutlookDBError as e:
+        logger.warning("Outlook database unusable: %s", e)
+        return False
+    if probe is None:
+        logger.warning("Outlook database has no inbox folder; not using it")
+        return False
+    fid, db_count = probe
+    script = f'''tell application "Microsoft Outlook"
+    set f to mail folder id {fid}
+    return (name of f) & "{DELIM}" & ((count of messages of f) as text)
+end tell'''
+    try:
+        raw = await bridge.run(script)
+        as_count = int(raw.rsplit(DELIM, 1)[-1].strip())
+    except Exception as e:
+        logger.warning("Outlook database trust check failed (folder id %s): %s", fid, e)
+        return False
+    allowed = max(_TRUST_DRIFT_MIN, int(db_count * _TRUST_DRIFT_FRACTION))
+    if abs(as_count - db_count) > allowed:
+        logger.warning(
+            "Outlook database inbox count %s differs from AppleScript %s; "
+            "treating database as stale", db_count, as_count,
+        )
+        return False
+    logger.info("Outlook database trusted (inbox id %s, %s messages)", fid, db_count)
+    return True
 
 
 # --- Helper: truncate long text ---
@@ -334,7 +411,15 @@ async def list_emails(
     Returns:
         JSON array of email summary objects.
     """
-    folder_ref = resolve_folder_ref(folder)
+    fid = await _db_folder_id(folder)
+    if fid is not None:
+        try:
+            rows = await asyncio.to_thread(db.list_messages, fid, count, unread_only)
+            return json.dumps(rows, indent=2, default=str)
+        except OutlookDBError as e:
+            logger.warning("Outlook database list failed; using AppleScript: %s", e)
+
+    folder_ref = resolve_folder_ref(folder) if fid is None else f"mail folder id {fid}"
     unread_filter = ' whose is read is false' if unread_only else ''
 
     # Batched property fetches: one Apple Event per property (whole column)
@@ -531,7 +616,7 @@ async def read_email(
     return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody
 end tell'''
     elif subject_search:
-        folder_ref = resolve_folder_ref(folder)
+        folder_ref = await _folder_ref(folder)
         safe_query = escape(subject_search)
         script = f'''tell application "Microsoft Outlook"
     set folderRef to {folder_ref}
@@ -691,7 +776,7 @@ async def move_email(
     Returns:
         Confirmation with email subject and destination, or an error.
     """
-    dest_ref = resolve_folder_ref(target_folder)
+    dest_ref = await _folder_ref(target_folder)
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set msubject to subject of m
@@ -929,12 +1014,16 @@ async def search_emails(
 ) -> str:
     """Search for emails in Outlook using text search.
 
-    Searches email subjects using Outlook's AppleScript filtering.
+    On legacy Outlook for Mac the search runs against Outlook's local
+    message index and matches subject, sender name, sender address, and
+    the message preview text. Reply/forward prefixes ("Re:", "FW:") are
+    ignored. If the index is unavailable, the search falls back to
+    AppleScript filtering on subject only.
     Results include entry_id for further operations.
 
     Args:
-        query: The search term (case-insensitive substring match on subject).
-            Examples: "budget report", "meeting notes", "quarterly".
+        query: The search term (case-insensitive substring match).
+            Examples: "budget report", "meeting notes", "alice@example.com".
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
@@ -942,7 +1031,15 @@ async def search_emails(
     Returns:
         JSON array of matching email summaries, or an error.
     """
-    folder_ref = resolve_folder_ref(folder)
+    fid = await _db_folder_id(folder)
+    if fid is not None:
+        try:
+            rows = await asyncio.to_thread(db.search_messages, fid, query, count)
+            return json.dumps(rows, indent=2, default=str)
+        except OutlookDBError as e:
+            logger.warning("Outlook database search failed; using AppleScript: %s", e)
+
+    folder_ref = resolve_folder_ref(folder) if fid is None else f"mail folder id {fid}"
     safe_query = escape(query)
 
     msg_spec = f'(every message of folderRef whose subject contains "{safe_query}")'
@@ -2074,8 +2171,15 @@ def main():
     import asyncio
 
     async def _start():
+        global db
         logger.info("Starting Outlook Desktop MCP server (macOS)...")
         await bridge.start()
+        path = outlook_db.locate()
+        if path is None:
+            logger.info("No Outlook profile database found; list/search use AppleScript")
+        elif await _trust_db(OutlookDB(path)):
+            db = OutlookDB(path)
+            logger.info("Using Outlook profile database for list/search: %s", path)
         logger.info("AppleScript bridge ready. Starting MCP stdio transport...")
 
     asyncio.run(_start())
