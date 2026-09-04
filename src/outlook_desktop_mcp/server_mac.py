@@ -582,12 +582,11 @@ async def read_email(
     set mid to id of m
     set msubject to subject of m
     set msender to ""
-    try
-        set msender to address of sender of m
-    end try
     set msenderName to ""
     try
-        set msenderName to name of sender of m
+        set senderRec to sender of m
+        set msender to address of senderRec
+        set msenderName to name of senderRec
     end try
     set mtime to time received of m as string
     set misread to is read of m
@@ -599,14 +598,16 @@ async def read_email(
     try
         set recips to to recipients of m
         repeat with r in recips
-            set mto to mto & address of r & "; "
+            set ea to email address of r
+            set mto to mto & (address of ea) & "; "
         end repeat
     end try
     set mcc to ""
     try
         set recips to cc recipients of m
         repeat with r in recips
-            set mcc to mcc & address of r & "; "
+            set ea to email address of r
+            set mcc to mcc & (address of ea) & "; "
         end repeat
     end try
     set mbody to ""
@@ -626,12 +627,11 @@ end tell'''
     set mid to id of m
     set msubject to subject of m
     set msender to ""
-    try
-        set msender to address of sender of m
-    end try
     set msenderName to ""
     try
-        set msenderName to name of sender of m
+        set senderRec to sender of m
+        set msender to address of senderRec
+        set msenderName to name of senderRec
     end try
     set mtime to time received of m as string
     set misread to is read of m
@@ -643,14 +643,16 @@ end tell'''
     try
         set recips to to recipients of m
         repeat with r in recips
-            set mto to mto & address of r & "; "
+            set ea to email address of r
+            set mto to mto & (address of ea) & "; "
         end repeat
     end try
     set mcc to ""
     try
         set recips to cc recipients of m
         repeat with r in recips
-            set mcc to mcc & address of r & "; "
+            set ea to email address of r
+            set mcc to mcc & (address of ea) & "; "
         end repeat
     end try
     set mbody to ""

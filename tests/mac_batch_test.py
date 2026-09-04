@@ -419,6 +419,35 @@ def test_script_timeout_env_override():
           str(applescript_bridge.SCRIPT_TIMEOUT))
 
 
+def test_read_email_extracts_sender_and_recipients():
+    log("--- read_email reads sender/recipient records via local variables ---")
+    record = DELIM.join([
+        "195322", "Hello", "a@b.com", "Alice", "2026-09-04 10:00:00",
+        "true", "0", "r1@b.com; ", "c1@b.com; c2@b.com; ", "body text",
+    ])
+    for kwargs in ({"entry_id": "195322"}, {"subject_search": "Hello"}):
+        fake = FakeBridge(output=record)
+        server_mac.bridge = fake
+        result = json.loads(asyncio.run(server_mac.read_email(**kwargs)))
+        script = fake.scripts[0]
+        label = "entry_id" if "entry_id" in kwargs else "subject_search"
+        check(f"{label}: sender record stored before reading address",
+              "set senderRec to sender of m" in script
+              and "set msender to address of senderRec" in script
+              and "set msenderName to name of senderRec" in script)
+        check(f"{label}: no chained sender specifier",
+              "address of sender of m" not in script
+              and "name of sender of m" not in script)
+        check(f"{label}: recipient address read from email address record",
+              "set ea to email address of r" in script
+              and "address of ea" in script)
+        check(f"{label}: no direct address of recipient",
+              "address of r &" not in script)
+        check(f"{label}: to parsed", result.get("to") == "r1@b.com;", str(result))
+        check(f"{label}: cc parsed", result.get("cc") == "c1@b.com; c2@b.com;", str(result))
+        check(f"{label}: sender parsed", result.get("sender") == "a@b.com", str(result))
+
+
 def main():
     test_list_emails_uses_batch_script()
     test_list_emails_unread_uses_whose_filter()
@@ -441,6 +470,7 @@ def main():
     test_update_event_uses_date_components()
     test_create_task_uses_date_components()
     test_script_timeout_env_override()
+    test_read_email_extracts_sender_and_recipients()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")
