@@ -74,3 +74,16 @@ suites waits the full 10 s — cost if wrong: none (an explicit timing test cove
   (3) a poll on the AppleScript fallback can overrun ROUND_TRIP by up to 243 s (bounded).
 - Live test left three "Safe to delete" messages in the test mailbox (subject
   `[MCP live test 2026-09-16 08:28:59] reply regression`).
+
+### Task 2 — bounded database queries, deferred trust check, ping
+- BASE df9e88c → HEAD 571ce18. Implementer (fresh) DONE_WITH_CONCERNS: added `FakeBridge.start()`
+  to the db test fake (mirrors the real bridge's single version probe); trimmed unused imports in
+  the live test; batch test unchanged (nothing in the brief required it). Accepted.
+- Reviewer (fresh): SPEC PASS, CODE PASS. Independently: gate 126/126, 94/94; live startup 0.10 s
+  with state unchecked; ping ok 42 ms; first list call ran the trust check in 0.96 s → trusted;
+  5 concurrent first calls → one probe; runaway query interrupted in 7 ms; 300 tight queries → no
+  stray timer threads.
+- Deferred minors: (1) busy back-off sleeps before the timer/connection cleanup; (2) list/search
+  read the global `db` instead of the handle `_ensure_db` returned; (3) a burst of concurrent
+  first calls under a busy Outlook each pay up to 10 s; (4) `_env_seconds` duplicates the bridge
+  helper; (5) README's 260 s bound omits the ~6.6 s busy-retry path.
