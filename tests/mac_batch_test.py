@@ -538,7 +538,27 @@ def test_reply_email_uses_dictionary_reply_command():
             log("  SKIP: compile check (Outlook not running)")
 
 
+def test_send_email_looks_up_sent_copy_without_db():
+    log("--- send_email falls back to an AppleScript Sent Items lookup ---")
+    server_mac.db = None
+
+    class TwoStep(FakeBridge):
+        async def run(self, script, timeout=None):
+            self.scripts.append(script)
+            return "" if len(self.scripts) == 1 else "777"
+
+    fake = TwoStep()
+    server_mac.bridge = fake
+    result = asyncio.run(server_mac.send_email(to="a@x.com", subject="Hi", body="x"))
+    check("send then lookup", len(fake.scripts) == 2, str(len(fake.scripts)))
+    if len(fake.scripts) == 2:
+        check("lookup reads sent items", "sent items" in fake.scripts[1])
+        check("lookup compares the subject", 'subject of m is "Hi"' in fake.scripts[1], fake.scripts[1])
+    check("confirmation carries id", result.endswith("(Sent Items id 777)"), result)
+
+
 def main():
+    server_mac._SENT_CONFIRM_TIMEOUT = 0.0  # unit tests never wait for Outlook's Sent Items write
     test_list_emails_uses_batch_script()
     test_list_emails_unread_uses_whose_filter()
     test_list_emails_falls_back_to_legacy()
@@ -565,6 +585,7 @@ def main():
     test_search_emails_legacy_reads_sender_via_variable()
     test_get_event_reads_attendee_address_via_variable()
     test_reply_email_uses_dictionary_reply_command()
+    test_send_email_looks_up_sent_copy_without_db()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")

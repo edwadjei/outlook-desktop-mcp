@@ -219,6 +219,7 @@ AppleScript's `whose` clause makes Outlook walk every message in the folder, one
 - Search matches subject, sender name, sender address, and the message preview, and ignores `Re:`/`FW:` prefixes (the database stores a normalized subject, so results show the subject without those prefixes).
 - Folder names are resolved through the database's folder table, which also fixes the `inbox` keyword resolving to the empty local "On My Computer" store on Exchange profiles; action tools then address folders by id.
 - The ids returned are the same ones `read_email`, `reply_email`, `move_email`, and the mark tools use through AppleScript.
+- A message you just sent sits in the Outbox for a few seconds, then Outlook writes a new Sent Items record with a new id. `send_email` and `reply_email` wait up to 10 s for that record and name it in their confirmation (`(Sent Items id N)`); `list_emails(folder="sent")` called inside that window will not show it yet. Verify sends by the confirmation id or `search_emails`, not by the top of `list_emails`.
 
 Safety and fallback:
 

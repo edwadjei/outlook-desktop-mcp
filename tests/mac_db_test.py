@@ -531,7 +531,68 @@ def test_query_deadline_interrupts_long_query():
     check("default deadline is 20s", outlook_db.DB_TIMEOUT == 20.0, str(outlook_db.DB_TIMEOUT))
 
 
+def test_list_messages_tie_breaks_on_record_id():
+    log("--- equal timestamps are ordered by record id, newest first ---")
+    mail = MAIL + [
+        (301, 115, "Same second A", "A", "a@x.com", "", 0, 0, T0 + 500, 0, 0),
+        (302, 115, "Same second B", "B", "b@x.com", "", 0, 0, T0 + 500, 0, 0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d, mail=mail))
+        ids = [r["entry_id"] for r in db.list_messages(115, 2)]
+        check("newest record first among equals", ids == ["302", "301"], str(ids))
+
+
+def test_normalize_subject():
+    log("--- normalize_subject strips reply and forward prefixes ---")
+    check("RE:", outlook_db.normalize_subject("RE: budget") == "budget")
+    check("nested", outlook_db.normalize_subject("Re: FW: Fwd: budget") == "budget")
+    check("plain", outlook_db.normalize_subject("  budget  ") == "budget")
+    check("inner Re kept", outlook_db.normalize_subject("Re: about the Re: thing") == "about the Re: thing")
+
+
+def test_find_sent_copy():
+    log("--- find_sent_copy returns the newest matching sent row after `since` ---")
+    mail = MAIL + [
+        (401, 127, "budget", "Me", "me@x.com", "older reply", 1, 0, T0 + 1000, 0, 0),
+        (402, 127, "budget", "Me", "me@x.com", "newer reply", 1, 0, T0 + 2000, 0, 0),
+        (403, 127, "budget", "Me", "me@x.com", "deleted", 1, 0, T0 + 3000, 1, 0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d, mail=mail))
+        row = db.find_sent_copy(127, "RE: budget", since=T0 + 1500)
+        check("newest live row after since", row is not None and row["entry_id"] == "402", str(row))
+        check("older rows ignored", db.find_sent_copy(127, "budget", since=T0 + 2500) is None)
+        check("case-insensitive subject", db.find_sent_copy(127, "BUDGET", since=T0) is not None)
+        check("other folder ignored", db.find_sent_copy(115, "budget", since=T0) is None)
+
+
+def test_server_send_email_confirms_sent_copy():
+    log("--- send_email and reply_email report the Sent Items id ---")
+    with tempfile.TemporaryDirectory() as d:
+        mail = MAIL + [(501, 127, "Hello there", "Me", "me@x.com", "", 1, 0, int(time.time()) + 5, 0, 0)]
+        server_mac.db = OutlookDB(build_fixture(d, mail=mail))
+        server_mac.bridge = FakeBridge(output="")
+        result = asyncio.run(server_mac.send_email(to="a@x.com", subject="Hello there", body="hi"))
+        check("send confirmation carries the Sent Items id", result.endswith("(Sent Items id 501)"), result)
+        server_mac.bridge = FakeBridge(output="RE: Hello there")
+        result = asyncio.run(server_mac.reply_email(entry_id="1", body="hi"))
+        check("reply confirmation carries the Sent Items id", result.endswith("(Sent Items id 501)"), result)
+
+        old = server_mac._SENT_CONFIRM_TIMEOUT
+        server_mac._SENT_CONFIRM_TIMEOUT = 0.6
+        try:
+            t0 = time.time()
+            result = asyncio.run(server_mac.send_email(to="a@x.com", subject="Never lands", body="hi"))
+            check("missing copy reported", result.endswith("(Sent Items copy not visible yet; verify with search_emails)"), result)
+            check("gives up after the confirm timeout", 0.5 < time.time() - t0 < 3.0, f"{time.time() - t0:.2f}s")
+        finally:
+            server_mac._SENT_CONFIRM_TIMEOUT = old
+    server_mac.db = None
+
+
 def main():
+    server_mac._SENT_CONFIRM_TIMEOUT = 0.0  # unit tests never wait for Outlook's Sent Items write
     test_locate_missing_file()
     test_locate_env_override()
     test_resolve_builtin_folders_prefer_exchange()
@@ -556,6 +617,10 @@ def main():
     test_server_trust_check_is_deferred_to_first_use()
     test_ping_tool()
     test_query_deadline_interrupts_long_query()
+    test_list_messages_tie_breaks_on_record_id()
+    test_normalize_subject()
+    test_find_sent_copy()
+    test_server_send_email_confirms_sent_copy()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")

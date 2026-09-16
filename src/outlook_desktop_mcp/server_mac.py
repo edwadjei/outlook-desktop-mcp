@@ -90,6 +90,53 @@ _STARTED_AT = time.monotonic()
 _TRUST_DRIFT_MIN = 50
 _TRUST_DRIFT_FRACTION = 0.02
 
+# After `send`, Outlook parks the message in the Outbox for a few seconds
+# and then writes a new Sent Items record with a new id. Send tools poll
+# for that record so their confirmation can name it.
+_SENT_CONFIRM_TIMEOUT = 10.0
+_SENT_CONFIRM_INTERVAL = 0.5
+
+
+async def _sent_copy_id(subject: str, since: int) -> str | None:
+    """Id of the Sent Items copy of a message sent at `since`, or None if not visible in time."""
+    handle = await _ensure_db()
+    deadline = time.monotonic() + _SENT_CONFIRM_TIMEOUT
+    while True:
+        try:
+            if handle is not None:
+                fid = await asyncio.to_thread(handle.resolve_folder, "sent")
+                row = None
+                if fid is not None:
+                    row = await asyncio.to_thread(handle.find_sent_copy, fid, subject, since)
+                if row is not None:
+                    return row["entry_id"]
+            else:
+                folder_ref = await _folder_ref("sent")
+                raw = await bridge.run(f'''tell application "Microsoft Outlook"
+    set f to {folder_ref}
+    set n to count of messages of f
+    if n > 20 then set n to 20
+    repeat with i from 1 to n
+        set m to message i of f
+        if subject of m is "{escape(subject)}" then return (id of m as text)
+    end repeat
+    return ""
+end tell''')
+                if raw.strip():
+                    return raw.strip()
+        except (OutlookDBError, RuntimeError) as e:
+            logger.warning("Sent Items lookup failed: %s", e)
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_SENT_CONFIRM_INTERVAL)
+
+
+def _confirmation_suffix(sent_id: str | None) -> str:
+    if sent_id:
+        return f" (Sent Items id {sent_id})"
+    return " (Sent Items copy not visible yet; verify with search_emails)"
+
 
 async def _ensure_db() -> OutlookDB | None:
     """Return the trusted database handle, running the trust check on first use.
@@ -439,7 +486,9 @@ async def send_email(
             <strong>, <a href>, and <table border="1"> render for recipients.
 
     Returns:
-        A confirmation message with subject and recipients, or an error.
+        A confirmation message with subject and recipients, ending with the
+        id of the Sent Items copy ("(Sent Items id N)") once Outlook has
+        written it, or an error.
     """
     # Build recipient lines
     def _recipient_lines(addresses: str, kind: str) -> str:
@@ -463,8 +512,10 @@ async def send_email(
 end tell'''
 
     try:
+        since = int(time.time())
         await bridge.run(script)
-        return f"Email sent: '{subject}' to {to}"
+        sent_id = await _sent_copy_id(subject, since)
+        return f"Email sent: '{subject}' to {to}{_confirmation_suffix(sent_id)}"
     except Exception as e:
         return f"Error sending email: {e}"
 
@@ -492,6 +543,9 @@ async def list_emails(
         folder: The folder to list. Case-insensitive names: "inbox" (default),
             "sent"/"sentmail", "drafts", "deleted"/"trash", "junk"/"spam",
             "outbox", or any custom folder name visible in list_folders output.
+            Note: a message you just sent spends a few seconds in "outbox"
+            before it appears in "sent"; the id in the send tool's
+            confirmation, or search_emails, is the reliable check.
         count: Maximum number of emails to return. Default 10, max recommended 50.
         unread_only: If true, only return unread emails. Default false.
 
@@ -906,7 +960,9 @@ async def reply_email(
         html_body: Recommended. HTML fragment for the reply text.
 
     Returns:
-        Confirmation indicating the reply was sent, or an error.
+        Confirmation indicating the reply was sent, ending with the id of
+        the Sent Items copy ("(Sent Items id N)") once Outlook has written
+        it, or an error.
     """
     # Outlook's dictionary: `reply to <message>` with boolean parameters
     # `reply to all` and `opening window`. There is no `reply all to` command.
@@ -942,8 +998,10 @@ tell application "Microsoft Outlook"
 end tell'''
 
     try:
+        since = int(time.time())
         subject = await bridge.run(script)
-        return f"Reply sent to '{subject}' (reply_all={reply_all})"
+        sent_id = await _sent_copy_id(subject, since)
+        return f"Reply sent to '{subject}' (reply_all={reply_all}){_confirmation_suffix(sent_id)}"
     except Exception as e:
         return f"Error replying to email: {e}"
 

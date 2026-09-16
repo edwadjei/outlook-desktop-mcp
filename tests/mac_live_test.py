@@ -17,6 +17,7 @@ import sys
 import os
 import json
 import asyncio
+import re
 import time
 from datetime import datetime
 
@@ -70,10 +71,22 @@ async def start_server():
     await server_mac.startup()
     await server_mac._ensure_db()
     log(f"  database: {server_mac._db_state}")
+    check("database trusted for the live test", server_mac._db_state == "trusted")
+
+
+async def check_sent_copy(result, subject):
+    """The confirmation names a Sent Items id, and that id reads back."""
+    m = re.search(r"\(Sent Items id (\d+)\)", result)
+    check("confirmation names the Sent Items id", m is not None, result)
+    if m:
+        copy = json.loads(await server_mac.read_email(entry_id=m.group(1)))
+        check("Sent Items id readable", copy.get("subject", "").lower().endswith(subject.lower()), str(copy)[:200])
 
 
 async def run():
     await start_server()
+    if server_mac._db_state != "trusted":
+        return  # subject matching below needs the database; fail fast, do not poll for minutes
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     subject = f"[MCP live test {stamp}] reply regression"
 
@@ -82,6 +95,7 @@ async def run():
         to=SCRATCH, subject=subject,
         body="Seed for the reply regression test. Safe to delete.\n\nBr,\nEdward.")
     check("send_email reported success", result.startswith("Email sent"), result)
+    await check_sent_copy(result, subject)
     sent = await wait_for_count("sent", subject, 1)
     check("seed appears in Sent Items", len(sent) >= 1)
     received = await wait_for_count("inbox", subject, 1)
@@ -98,6 +112,7 @@ async def run():
             body=f"Reply with reply_all={reply_all}. Safe to delete.\n\nBr,\nEdward.")
         check(f"reply_all={reply_all}: reply_email reported success",
               result.startswith("Reply sent"), result)
+        await check_sent_copy(result, subject)
         expected_sent += 1
         sent = await wait_for_count("sent", subject, expected_sent)
         check(f"reply_all={reply_all}: reply appears in Sent Items",

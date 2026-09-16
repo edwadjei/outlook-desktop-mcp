@@ -15,6 +15,7 @@ short busy timeout so Outlook's own writes are never blocked.
 import glob
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -56,6 +57,13 @@ _MESSAGE_COLUMNS = (
 )
 _LIVE_ROWS = "IFNULL(Message_MarkedForDelete, 0) = 0"
 _BUSY_RETRIES = 3
+
+_PREFIX_RE = re.compile(r"^\s*(?:(?:re|fw|fwd|aw|sv|wg)\s*:\s*)+", re.IGNORECASE)
+
+
+def normalize_subject(subject: str) -> str:
+    """Subject without leading reply/forward prefixes, as Outlook stores it."""
+    return _PREFIX_RE.sub("", subject or "").strip()
 
 
 def _env_seconds(name: str, default: float) -> float:
@@ -229,10 +237,27 @@ class OutlookDB:
         rows = self._query(
             f"SELECT {_MESSAGE_COLUMNS} FROM Mail "
             f"WHERE Record_FolderID = ? AND {_LIVE_ROWS}{unread} "
-            "ORDER BY Message_TimeReceived DESC LIMIT ?",
+            "ORDER BY Message_TimeReceived DESC, Record_RecordID DESC LIMIT ?",
             (folder_id, max(0, int(count))),
         )
         return [self._row_to_summary(r) for r in rows]
+
+    def find_sent_copy(self, folder_id: int, subject: str, since: int) -> dict | None:
+        """Newest live row in folder with this normalized subject received at or after `since`.
+
+        Used right after a send: Outlook keeps the message in the Outbox for
+        a few seconds and then writes a new Sent Items row, so the caller
+        polls this until it returns a row.
+        """
+        rows = self._query(
+            f"SELECT {_MESSAGE_COLUMNS} FROM Mail "
+            f"WHERE Record_FolderID = ? AND {_LIVE_ROWS} "
+            "AND Message_NormalizedSubject = ? COLLATE NOCASE "
+            "AND IFNULL(Message_TimeReceived, 0) >= ? "
+            "ORDER BY Message_TimeReceived DESC, Record_RecordID DESC LIMIT 1",
+            (folder_id, normalize_subject(subject), int(since)),
+        )
+        return self._row_to_summary(rows[0]) if rows else None
 
     def search_messages(self, folder_id: int, query: str, count: int) -> list[dict]:
         """Case-insensitive substring search over subject, sender, and preview."""
