@@ -960,9 +960,10 @@ async def reply_email(
         html_body: Recommended. HTML fragment for the reply text.
 
     Returns:
-        Confirmation indicating the reply was sent, ending with the id of
-        the Sent Items copy ("(Sent Items id N)") once Outlook has written
-        it, or an error.
+        Confirmation naming the subject actually sent (Outlook's reply
+        subject, e.g. "RE: <original>"), ending with the id of the Sent
+        Items copy ("(Sent Items id N)") once Outlook has written it, or
+        an error.
     """
     # Outlook's dictionary: `reply to <message>` with boolean parameters
     # `reply to all` and `opening window`. There is no `reply all to` command.
@@ -974,7 +975,6 @@ async def reply_email(
     # front of the document.
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
-    set msubject to subject of m
     set replyMsg to reply to m {reply_opts}
     set origContent to content of replyMsg
 end tell
@@ -994,7 +994,7 @@ end if
 tell application "Microsoft Outlook"
     set content of replyMsg to newContent
     send replyMsg
-    return msubject
+    return subject of replyMsg
 end tell'''
 
     try:
