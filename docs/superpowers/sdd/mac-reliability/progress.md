@@ -87,3 +87,29 @@ suites waits the full 10 s — cost if wrong: none (an explicit timing test cove
   read the global `db` instead of the handle `_ensure_db` returned; (3) a burst of concurrent
   first calls under a busy Outlook each pay up to 10 s; (4) `_env_seconds` duplicates the bridge
   helper; (5) README's 260 s bound omits the ~6.6 s busy-retry path.
+
+### Task 3 — Sent Items confirmation; stable sent ordering
+- BASE a5f1826 → HEAD b3541d0. Implementer (fresh) DONE; live test 14/14 on one run (Sent Items
+  rows 197820, 197823, 197825 verified by the reviewer in the database).
+- Reviewer (fresh): SPEC PASS, CODE PASS with one Important finding: on the AppleScript fallback
+  the reply lookup compares `subject of m` with the ORIGINAL subject, but a reply's Sent Items copy
+  is "RE: <subject>", so on an untrusted-database profile every first reply waits 10 s and reports
+  "not visible yet" (never a wrong id). Inherited from the brief's snippet.
+- Ruling: fix in a Task 3 fix round by having the reply script return `subject of replyMsg` (the
+  subject actually sent) instead of `subject of m`, so both lookup paths compare the real sent
+  subject and the confirmation names it — one-line change, no new branch in the lookup — cost if
+  wrong: the confirmation text shows "RE: subject" instead of the bare subject.
+- Deferred minors: (2) with a trusted database and no resolvable sent folder the loop re-resolves
+  for 10 s instead of falling back; (3) the fallback id is returned unvalidated (`isdigit` guard);
+  (4) `find_sent_copy` relies on `Message_TimeReceived` being local creation time — comment it;
+  (5) live test should log the matched id on PASS.
+- Fix round 1 (4d5b9dd): reply script returns `subject of replyMsg`. Re-review: ADDRESSED, but new
+  Important finding — reading the outgoing message after `send` races the Outbox transit that
+  deletes its record (-1728 observed on a transited id), which would report an error for a reply
+  that was sent.
+- Ruling: fix round 2 reads the subject into `sentSubject` before `send` and returns it — Outlook
+  sets the Re: prefix at creation, so the value is identical, and no post-send read remains —
+  cost if wrong: none identified.
+- Fix round 2 (b844fa6): subject read into `sentSubject` before `send`. Re-review: ADDRESSED, no
+  new findings. Task 3 closed at b844fa6 (three commits: b3541d0, 4d5b9dd, b844fa6). Reply path
+  changed after the live run; the close-out live run covers it.
