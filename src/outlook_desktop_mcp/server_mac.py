@@ -821,7 +821,10 @@ async def reply_email(
     Returns:
         Confirmation indicating the reply was sent, or an error.
     """
-    reply_cmd = "reply all to" if reply_all else "reply to"
+    # Outlook's dictionary: `reply to <message>` with boolean parameters
+    # `reply to all` and `opening window`. There is no `reply all to` command.
+    reply_opts = ("with reply to all without opening window" if reply_all
+                  else "without opening window")
     reply_html = html_body if html_body else text_to_html(body)
     # Outlook's reply draft is a full <html><body>...</body></html> document
     # holding the quoted thread; the reply must go inside <body>, not in
@@ -829,7 +832,7 @@ async def reply_email(
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set msubject to subject of m
-    set replyMsg to {reply_cmd} m without opening window
+    set replyMsg to reply to m {reply_opts}
     set origContent to content of replyMsg
 end tell
 set replyHtml to "{escape(reply_html)}"

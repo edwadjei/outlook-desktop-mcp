@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import asyncio
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -317,7 +318,7 @@ def test_reply_email_inserts_html_after_body_tag():
     result = asyncio.run(server_mac.reply_email(
         entry_id="42", body="Thanks.\n\nRegards,\nAlex", reply_all=True))
     script = fake.scripts[0]
-    check("reply all command", "reply all to m" in script)
+    check("reply all command", "reply to m with reply to all" in script)
     check("original content read back", "set origContent to content of replyMsg" in script)
     check("plain body converted to HTML",
           'set replyHtml to "<p>Thanks.</p><p>Regards,<br>Alex</p>"' in script, script)
@@ -499,6 +500,44 @@ def test_get_event_reads_attendee_address_via_variable():
     check("attendees parsed", result.get("attendees") == "x@b.com; y@b.com;", str(result))
 
 
+def _outlook_running():
+    import subprocess
+    return subprocess.run(["pgrep", "-x", "Microsoft Outlook"],
+                          capture_output=True).returncode == 0
+
+
+def _compiles(script):
+    """Compile (never run) an AppleScript with osacompile. Returns (ok, stderr)."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "s.applescript")
+        with open(src, "w") as fh:
+            fh.write(script)
+        proc = subprocess.run(["osacompile", "-o", os.path.join(d, "s.scpt"), src],
+                              capture_output=True, text=True)
+        return proc.returncode == 0, proc.stderr.strip()
+
+
+def test_reply_email_uses_dictionary_reply_command():
+    log("--- reply_email uses 'reply to' with the 'reply to all' parameter ---")
+    for reply_all in (False, True):
+        fake = FakeBridge(output="Subj")
+        server_mac.bridge = fake
+        result = asyncio.run(server_mac.reply_email(entry_id="1", body="Test", reply_all=reply_all))
+        script = fake.scripts[0]
+        check(f"reply_all={reply_all}: reported success", result.startswith("Reply sent"), result)
+        check(f"reply_all={reply_all}: no invented 'reply all to' command",
+              "reply all to" not in script)
+        expected = ("set replyMsg to reply to m with reply to all without opening window"
+                    if reply_all else "set replyMsg to reply to m without opening window")
+        check(f"reply_all={reply_all}: reply command", expected in script, script[:400])
+        if _outlook_running():
+            ok, err = _compiles(script)
+            check(f"reply_all={reply_all}: script compiles against Outlook", ok, err)
+        else:
+            log("  SKIP: compile check (Outlook not running)")
+
+
 def main():
     test_list_emails_uses_batch_script()
     test_list_emails_unread_uses_whose_filter()
@@ -525,6 +564,7 @@ def main():
     test_list_emails_legacy_reads_sender_via_variable()
     test_search_emails_legacy_reads_sender_via_variable()
     test_get_event_reads_attendee_address_via_variable()
+    test_reply_email_uses_dictionary_reply_command()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")
