@@ -1,9 +1,10 @@
 ---
 id: TASK-4
 title: search_emails by recipient and sender; document preview limit
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-09-16 08:26'
+updated_date: '2026-09-16 09:00'
 labels:
   - macos
   - enhancement
