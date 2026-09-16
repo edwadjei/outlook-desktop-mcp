@@ -1,9 +1,10 @@
 ---
 id: TASK-3
 title: Confirm Sent Items copy after send and reply; stable sent ordering
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-09-16 08:26'
+updated_date: '2026-09-16 08:43'
 labels:
   - macos
   - bug
