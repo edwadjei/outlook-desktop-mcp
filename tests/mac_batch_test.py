@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import asyncio
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -317,7 +318,7 @@ def test_reply_email_inserts_html_after_body_tag():
     result = asyncio.run(server_mac.reply_email(
         entry_id="42", body="Thanks.\n\nRegards,\nAlex", reply_all=True))
     script = fake.scripts[0]
-    check("reply all command", "reply all to m" in script)
+    check("reply all command", "reply to m with reply to all" in script)
     check("original content read back", "set origContent to content of replyMsg" in script)
     check("plain body converted to HTML",
           'set replyHtml to "<p>Thanks.</p><p>Regards,<br>Alex</p>"' in script, script)
@@ -499,7 +500,100 @@ def test_get_event_reads_attendee_address_via_variable():
     check("attendees parsed", result.get("attendees") == "x@b.com; y@b.com;", str(result))
 
 
+def _outlook_running():
+    import subprocess
+    return subprocess.run(["pgrep", "-x", "Microsoft Outlook"],
+                          capture_output=True).returncode == 0
+
+
+def _compiles(script):
+    """Compile (never run) an AppleScript with osacompile. Returns (ok, stderr)."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "s.applescript")
+        with open(src, "w") as fh:
+            fh.write(script)
+        proc = subprocess.run(["osacompile", "-o", os.path.join(d, "s.scpt"), src],
+                              capture_output=True, text=True)
+        return proc.returncode == 0, proc.stderr.strip()
+
+
+def test_reply_email_uses_dictionary_reply_command():
+    log("--- reply_email uses 'reply to' with the 'reply to all' parameter ---")
+    for reply_all in (False, True):
+        fake = FakeBridge(output="Subj")
+        server_mac.bridge = fake
+        result = asyncio.run(server_mac.reply_email(entry_id="1", body="Test", reply_all=reply_all))
+        script = fake.scripts[0]
+        check(f"reply_all={reply_all}: reported success", result.startswith("Reply sent"), result)
+        check(f"reply_all={reply_all}: no invented 'reply all to' command",
+              "reply all to" not in script)
+        expected = ("set replyMsg to reply to m with reply to all without opening window"
+                    if reply_all else "set replyMsg to reply to m without opening window")
+        check(f"reply_all={reply_all}: reply command", expected in script, script[:400])
+        read_at = script.find("set sentSubject to subject of replyMsg")
+        send_at = script.find("send replyMsg")
+        check(f"reply_all={reply_all}: subject read into a variable before send",
+              read_at != -1 and send_at != -1 and read_at < send_at
+              and "return sentSubject" in script
+              and "return subject of replyMsg" not in script
+              and "return msubject" not in script,
+              script[-250:])
+        if _outlook_running():
+            ok, err = _compiles(script)
+            check(f"reply_all={reply_all}: script compiles against Outlook", ok, err)
+        else:
+            log("  SKIP: compile check (Outlook not running)")
+
+
+def test_send_email_looks_up_sent_copy_without_db():
+    log("--- send_email falls back to an AppleScript Sent Items lookup ---")
+    server_mac.db = None
+
+    class TwoStep(FakeBridge):
+        async def run(self, script, timeout=None):
+            self.scripts.append(script)
+            return "" if len(self.scripts) == 1 else "777"
+
+    fake = TwoStep()
+    server_mac.bridge = fake
+    result = asyncio.run(server_mac.send_email(to="a@x.com", subject="Hi", body="x"))
+    check("send then lookup", len(fake.scripts) == 2, str(len(fake.scripts)))
+    if len(fake.scripts) == 2:
+        check("lookup reads sent items", "sent items" in fake.scripts[1])
+        check("lookup compares the subject", 'subject of m is "Hi"' in fake.scripts[1], fake.scripts[1])
+    check("confirmation carries id", result.endswith("(Sent Items id 777)"), result)
+
+
+def test_save_attachment_uses_posix_file_and_verifies_output():
+    log("--- save_attachment saves through a POSIX file reference ---")
+    with tempfile.TemporaryDirectory() as d:
+        class Writes(FakeBridge):
+            async def run(self, script, timeout=None):
+                self.scripts.append(script)
+                with open(os.path.join(d, "image003.png"), "wb") as fh:
+                    fh.write(b"\x89PNG fake")
+                return f"image003.png{DELIM}{d}/image003.png"
+
+        fake = Writes()
+        server_mac.bridge = fake
+        result = json.loads(asyncio.run(server_mac.save_attachment(entry_id="1", attachment_index=1, save_directory=d)))
+        script = fake.scripts[0]
+        check("only one script", len(fake.scripts) == 1)
+        check("save uses POSIX file", "save a in (POSIX file savePath)" in script, script)
+        check("no string-path save", "save a in savePath\n" not in script)
+        check("dead placeholder script gone", "__PLACEHOLDER__" not in script)
+        check("saved status", result.get("status") == "saved", str(result))
+        check("path returned", result.get("path") == os.path.join(d, "image003.png"), str(result))
+        check("byte count returned", result.get("bytes") == 9, str(result))
+
+        server_mac.bridge = FakeBridge(output=f"ghost.png{DELIM}{d}/ghost.png")
+        result = asyncio.run(server_mac.save_attachment(entry_id="1", attachment_index=1, save_directory=d))
+        check("missing file reported as error", result.startswith("Error saving attachment") and "ghost.png" in result, result)
+
+
 def main():
+    server_mac._SENT_CONFIRM_TIMEOUT = 0.0  # unit tests never wait for Outlook's Sent Items write
     test_list_emails_uses_batch_script()
     test_list_emails_unread_uses_whose_filter()
     test_list_emails_falls_back_to_legacy()
@@ -525,6 +619,9 @@ def main():
     test_list_emails_legacy_reads_sender_via_variable()
     test_search_emails_legacy_reads_sender_via_variable()
     test_get_event_reads_attendee_address_via_variable()
+    test_reply_email_uses_dictionary_reply_command()
+    test_send_email_looks_up_sent_copy_without_db()
+    test_save_attachment_uses_posix_file_and_verifies_output()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")

@@ -13,10 +13,11 @@ import json
 import logging
 import os
 import re
+import time
 
 from mcp.server.fastmcp import FastMCP
 
-from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
+from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge, STARTUP_TIMEOUT
 from outlook_desktop_mcp import outlook_db
 from outlook_desktop_mcp.outlook_db import OutlookDB, OutlookDBError
 from outlook_desktop_mcp.utils.applescript_helpers import (
@@ -67,10 +68,20 @@ mcp = FastMCP(
 
 bridge = AppleScriptBridge()
 
-# Read-only handle on legacy Outlook's profile database, set at startup
-# once _trust_db() has confirmed it is the store AppleScript is reading.
+# Read-only handle on legacy Outlook's profile database. Set only after
+# _ensure_db() has confirmed it is the store AppleScript is reading.
 # None means every tool uses AppleScript only.
 db: OutlookDB | None = None
+
+# Candidate database located at startup, and the trust decision for it:
+#   "none"      no database file found
+#   "unchecked" found; trust check not yet completed (retried on next use)
+#   "trusted"   check passed; `db` is set
+#   "untrusted" check failed (stale store or unusable file); never retried
+_db_candidate: OutlookDB | None = None
+_db_state = "none"
+_db_lock: asyncio.Lock | None = None
+_STARTED_AT = time.monotonic()
 
 # Startup trust check: the database inbox count may differ from
 # AppleScript's by this much (mail arriving while we check) and still be
@@ -79,13 +90,86 @@ db: OutlookDB | None = None
 _TRUST_DRIFT_MIN = 50
 _TRUST_DRIFT_FRACTION = 0.02
 
+# After `send`, Outlook parks the message in the Outbox for a few seconds
+# and then writes a new Sent Items record with a new id. Send tools poll
+# for that record so their confirmation can name it.
+_SENT_CONFIRM_TIMEOUT = 10.0
+_SENT_CONFIRM_INTERVAL = 0.5
+
+
+async def _sent_copy_id(subject: str, since: int) -> str | None:
+    """Id of the Sent Items copy of a message sent at `since`, or None if not visible in time."""
+    handle = await _ensure_db()
+    deadline = time.monotonic() + _SENT_CONFIRM_TIMEOUT
+    while True:
+        try:
+            if handle is not None:
+                fid = await asyncio.to_thread(handle.resolve_folder, "sent")
+                row = None
+                if fid is not None:
+                    row = await asyncio.to_thread(handle.find_sent_copy, fid, subject, since)
+                if row is not None:
+                    return row["entry_id"]
+            else:
+                folder_ref = await _folder_ref("sent")
+                raw = await bridge.run(f'''tell application "Microsoft Outlook"
+    set f to {folder_ref}
+    set n to count of messages of f
+    if n > 20 then set n to 20
+    repeat with i from 1 to n
+        set m to message i of f
+        if subject of m is "{escape(subject)}" then return (id of m as text)
+    end repeat
+    return ""
+end tell''')
+                if raw.strip():
+                    return raw.strip()
+        except (OutlookDBError, RuntimeError) as e:
+            logger.warning("Sent Items lookup failed: %s", e)
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_SENT_CONFIRM_INTERVAL)
+
+
+def _confirmation_suffix(sent_id: str | None) -> str:
+    if sent_id:
+        return f" (Sent Items id {sent_id})"
+    return " (Sent Items copy not visible yet; verify with search_emails)"
+
+
+async def _ensure_db() -> OutlookDB | None:
+    """Return the trusted database handle, running the trust check on first use.
+
+    The check needs one short AppleScript call. Outlook serialises scripts
+    across every client, so doing it at startup could stall past the MCP
+    client's connect timeout; doing it here keeps startup instant. A timeout
+    leaves the decision open for the next call; a real mismatch is final.
+    """
+    global db, _db_state, _db_lock
+    if db is not None or _db_candidate is None or _db_state != "unchecked":
+        return db
+    if _db_lock is None:
+        _db_lock = asyncio.Lock()
+    async with _db_lock:
+        if _db_state == "unchecked":
+            verdict = await _trust_db(_db_candidate)
+            if verdict is True:
+                db = _db_candidate
+                _db_state = "trusted"
+                logger.info("Using Outlook profile database for list/search: %s", db.path)
+            elif verdict is False:
+                _db_state = "untrusted"
+    return db
+
 
 async def _db_folder_id(folder: str) -> int | None:
     """Resolve a folder name via the profile database, or None if unavailable."""
-    if db is None:
+    handle = await _ensure_db()
+    if handle is None:
         return None
     try:
-        return await asyncio.to_thread(db.resolve_folder, folder)
+        return await asyncio.to_thread(handle.resolve_folder, folder)
     except OutlookDBError as e:
         logger.warning("Outlook database folder lookup failed; using AppleScript: %s", e)
         return None
@@ -104,7 +188,7 @@ async def _folder_ref(folder: str) -> str:
     return resolve_folder_ref(folder)
 
 
-async def _trust_db(candidate: OutlookDB) -> bool:
+async def _trust_db(candidate: OutlookDB) -> bool | None:
     """Confirm the database is the live store behind AppleScript.
 
     Asks AppleScript for the message count of the folder the database calls
@@ -126,9 +210,12 @@ async def _trust_db(candidate: OutlookDB) -> bool:
     return (name of f) & "{DELIM}" & ((count of messages of f) as text)
 end tell'''
     try:
-        raw = await bridge.run(script)
+        raw = await bridge.run(script, timeout=STARTUP_TIMEOUT)
         as_count = int(raw.rsplit(DELIM, 1)[-1].strip())
     except Exception as e:
+        if "timed out" in str(e):
+            logger.warning("Outlook database trust check timed out; will retry on next use")
+            return None
         logger.warning("Outlook database trust check failed (folder id %s): %s", fid, e)
         return False
     allowed = max(_TRUST_DRIFT_MIN, int(db_count * _TRUST_DRIFT_FRACTION))
@@ -313,6 +400,53 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
 
 
 # =====================================================================
+# TOOL 0: ping
+# =====================================================================
+
+def _server_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("outlook-desktop-mcp")
+    except Exception:
+        return "unknown"
+
+
+@mcp.tool()
+async def ping() -> str:
+    """Check cheaply whether the server can reach Outlook.
+
+    Call this before starting a long task, or when another tool has stopped
+    answering. It runs one trivial AppleScript with a 10-second limit and
+    never raises.
+
+    Returns:
+        JSON with ok (bool), outlook_version, applescript_ms, db
+        ("trusted", "untrusted", "unchecked" or "none"), db_path,
+        server_version, uptime_s, and error when ok is false.
+    """
+    started = time.monotonic()
+    result = {
+        "ok": False,
+        "outlook_version": None,
+        "applescript_ms": None,
+        "db": _db_state,
+        "db_path": _db_candidate.path if _db_candidate is not None else None,
+        "server_version": _server_version(),
+        "uptime_s": int(time.monotonic() - _STARTED_AT),
+    }
+    try:
+        result["outlook_version"] = await bridge.run(
+            'tell application "Microsoft Outlook" to get version',
+            timeout=STARTUP_TIMEOUT,
+        )
+        result["ok"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    result["applescript_ms"] = int((time.monotonic() - started) * 1000)
+    return json.dumps(result, indent=2)
+
+
+# =====================================================================
 # TOOL 1: send_email
 # =====================================================================
 
@@ -352,7 +486,9 @@ async def send_email(
             <strong>, <a href>, and <table border="1"> render for recipients.
 
     Returns:
-        A confirmation message with subject and recipients, or an error.
+        A confirmation message with subject and recipients, ending with the
+        id of the Sent Items copy ("(Sent Items id N)") once Outlook has
+        written it, or an error.
     """
     # Build recipient lines
     def _recipient_lines(addresses: str, kind: str) -> str:
@@ -376,8 +512,10 @@ async def send_email(
 end tell'''
 
     try:
+        since = int(time.time())
         await bridge.run(script)
-        return f"Email sent: '{subject}' to {to}"
+        sent_id = await _sent_copy_id(subject, since)
+        return f"Email sent: '{subject}' to {to}{_confirmation_suffix(sent_id)}"
     except Exception as e:
         return f"Error sending email: {e}"
 
@@ -405,6 +543,9 @@ async def list_emails(
         folder: The folder to list. Case-insensitive names: "inbox" (default),
             "sent"/"sentmail", "drafts", "deleted"/"trash", "junk"/"spam",
             "outbox", or any custom folder name visible in list_folders output.
+            Note: a message you just sent spends a few seconds in "outbox"
+            before it appears in "sent"; the id in the send tool's
+            confirmation, or search_emails, is the reliable check.
         count: Maximum number of emails to return. Default 10, max recommended 50.
         unread_only: If true, only return unread emails. Default false.
 
@@ -819,17 +960,22 @@ async def reply_email(
         html_body: Recommended. HTML fragment for the reply text.
 
     Returns:
-        Confirmation indicating the reply was sent, or an error.
+        Confirmation naming the subject actually sent (Outlook's reply
+        subject, e.g. "RE: <original>"), ending with the id of the Sent
+        Items copy ("(Sent Items id N)") once Outlook has written it, or
+        an error.
     """
-    reply_cmd = "reply all to" if reply_all else "reply to"
+    # Outlook's dictionary: `reply to <message>` with boolean parameters
+    # `reply to all` and `opening window`. There is no `reply all to` command.
+    reply_opts = ("with reply to all without opening window" if reply_all
+                  else "without opening window")
     reply_html = html_body if html_body else text_to_html(body)
     # Outlook's reply draft is a full <html><body>...</body></html> document
     # holding the quoted thread; the reply must go inside <body>, not in
     # front of the document.
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
-    set msubject to subject of m
-    set replyMsg to {reply_cmd} m without opening window
+    set replyMsg to reply to m {reply_opts}
     set origContent to content of replyMsg
 end tell
 set replyHtml to "{escape(reply_html)}"
@@ -847,13 +993,16 @@ else
 end if
 tell application "Microsoft Outlook"
     set content of replyMsg to newContent
+    set sentSubject to subject of replyMsg
     send replyMsg
-    return msubject
+    return sentSubject
 end tell'''
 
     try:
+        since = int(time.time())
         subject = await bridge.run(script)
-        return f"Reply sent to '{subject}' (reply_all={reply_all})"
+        sent_id = await _sent_copy_id(subject, since)
+        return f"Reply sent to '{subject}' (reply_all={reply_all}){_confirmation_suffix(sent_id)}"
     except Exception as e:
         return f"Error replying to email: {e}"
 
@@ -1009,36 +1158,51 @@ end tell'''
 
 @mcp.tool()
 async def search_emails(
-    query: str,
+    query: str = "",
     folder: str = "inbox",
     count: int = 10,
+    recipient: str = "",
+    sender: str = "",
 ) -> str:
-    """Search for emails in Outlook using text search.
+    """Search for emails in Outlook.
 
     On legacy Outlook for Mac the search runs against Outlook's local
-    message index and matches subject, sender name, sender address, and
-    the message preview text. Reply/forward prefixes ("Re:", "FW:") are
-    ignored. If the index is unavailable, the search falls back to
-    AppleScript filtering on subject only.
-    Results include entry_id for further operations.
+    message index. `query` matches the subject, the sender name and
+    address, and the preview, which is only the FIRST 255 CHARACTERS of
+    the body. Full bodies are not indexed: a keyword that appears deeper
+    in a message is not found. To find pending requests reliably, filter
+    by `recipient` (and `sender`) and read candidates with read_email.
+    Reply/forward prefixes ("Re:", "FW:") are ignored.
+
+    If the index is unavailable, `query` falls back to AppleScript
+    filtering on subject only, and `recipient`/`sender` return an error
+    rather than silently searching without them.
 
     Args:
-        query: The search term (case-insensitive substring match).
-            Examples: "budget report", "meeting notes", "alice@example.com".
+        query: Substring for subject, sender and preview. May be empty
+            when recipient or sender is given.
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
+        recipient: Substring matched against To and CC addresses and the
+            displayed To names, e.g. "edward" or "isdemand".
+        sender: Substring matched against the sender name and address.
 
     Returns:
-        JSON array of matching email summaries, or an error.
+        JSON array of matching email summaries, newest first, or an error.
     """
+    if not (query.strip() or recipient.strip() or sender.strip()):
+        return json.dumps({"error": "Provide at least one of query, recipient, sender"})
     fid = await _db_folder_id(folder)
     if fid is not None:
         try:
-            rows = await asyncio.to_thread(db.search_messages, fid, query, count)
+            rows = await asyncio.to_thread(db.search_messages, fid, query, count, recipient, sender)
             return json.dumps(rows, indent=2, default=str)
         except OutlookDBError as e:
             logger.warning("Outlook database search failed; using AppleScript: %s", e)
+    if recipient.strip() or sender.strip():
+        return json.dumps({"error": "recipient and sender filters need Outlook's message index, "
+                                    "which is unavailable right now; retry, or search with query only"})
 
     folder_ref = resolve_folder_ref(folder) if fid is None else f"mail folder id {fid}"
     safe_query = escape(query)
@@ -2102,7 +2266,8 @@ async def save_attachment(
 ) -> str:
     """Save an attachment from an email to disk.
 
-    Downloads the specified attachment to a local directory.
+    Downloads the specified attachment to a local directory. Inline (pasted)
+    images are supported: they are listed as attachments and saved the same way.
 
     Args:
         entry_id: The numeric ID of the email containing the attachment.
@@ -2112,28 +2277,15 @@ async def save_attachment(
             Downloads folder.
 
     Returns:
-        The full file path where the attachment was saved, or an error.
+        JSON with status, filename, path and bytes, or an error.
     """
     if not save_directory:
         save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(save_directory, exist_ok=True)
 
-    # Use POSIX path for AppleScript
-    save_dir_posix = save_directory
-
-    script = f'''tell application "Microsoft Outlook"
-    set m to message id {entry_id}
-    set attList to attachments of m
-    set attCount to count of attList
-    if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s), requested index {attachment_index}"
-    set a to item {attachment_index} of attList
-    set aname to name of a
-    set savePath to POSIX file "{escape(save_dir_posix)}/{escape("__PLACEHOLDER__")}"
-    save a in file ((POSIX path of (POSIX file "{escape(save_dir_posix)}")) & aname)
-    return aname
-end tell'''
-
-    # Simpler approach: save to known path
+    # `save ... in` takes a file object. A POSIX path *string* is rejected
+    # with -2700 for inline images (which have no `file` of their own), so
+    # build the reference with `POSIX file`.
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set attList to attachments of m
@@ -2141,8 +2293,8 @@ end tell'''
     if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s)"
     set a to item {attachment_index} of attList
     set aname to name of a
-    set savePath to "{escape(save_dir_posix)}/" & aname
-    save a in savePath
+    set savePath to "{escape(save_directory)}/" & aname
+    save a in (POSIX file savePath)
     return aname & "{DELIM}" & savePath
 end tell'''
 
@@ -2150,16 +2302,18 @@ end tell'''
         raw = await bridge.run(script)
         if raw.startswith("ERROR:"):
             return raw
-
         parts = raw.split(DELIM)
-        filename = parts[0].strip() if len(parts) > 0 else "unknown"
+        filename = parts[0].strip() if parts else "unknown"
         save_path = os.path.join(save_directory, filename)
-        result = {
+        if not os.path.isfile(save_path) or os.path.getsize(save_path) == 0:
+            return (f"Error saving attachment: Outlook reported success but no file "
+                    f"was written at {save_path}")
+        return json.dumps({
             "status": "saved",
             "filename": filename,
             "path": save_path,
-        }
-        return json.dumps(result, indent=2, default=str)
+            "bytes": os.path.getsize(save_path),
+        }, indent=2, default=str)
     except Exception as e:
         return f"Error saving attachment: {e}"
 
@@ -2168,22 +2322,27 @@ end tell'''
 # Entry point
 # =====================================================================
 
+async def startup() -> None:
+    """Verify Outlook answers and locate the profile database.
+
+    The database trust check is deferred to first use (see _ensure_db) so
+    startup never waits behind another client's AppleScript.
+    """
+    global _db_candidate, _db_state
+    logger.info("Starting Outlook Desktop MCP server (macOS)...")
+    await bridge.start()
+    path = outlook_db.locate()
+    if path is None:
+        logger.info("No Outlook profile database found; list/search use AppleScript")
+    else:
+        _db_candidate = OutlookDB(path)
+        _db_state = "unchecked"
+        logger.info("Outlook profile database found (trust check on first use): %s", path)
+    logger.info("AppleScript bridge ready. Starting MCP stdio transport...")
+
+
 def main():
-    import asyncio
-
-    async def _start():
-        global db
-        logger.info("Starting Outlook Desktop MCP server (macOS)...")
-        await bridge.start()
-        path = outlook_db.locate()
-        if path is None:
-            logger.info("No Outlook profile database found; list/search use AppleScript")
-        elif await _trust_db(OutlookDB(path)):
-            db = OutlookDB(path)
-            logger.info("Using Outlook profile database for list/search: %s", path)
-        logger.info("AppleScript bridge ready. Starting MCP stdio transport...")
-
-    asyncio.run(_start())
+    asyncio.run(startup())
     try:
         mcp.run(transport="stdio")
     finally:

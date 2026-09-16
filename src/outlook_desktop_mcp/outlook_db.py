@@ -15,7 +15,9 @@ short busy timeout so Outlook's own writes are never blocked.
 import glob
 import logging
 import os
+import re
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from urllib.parse import quote
@@ -55,6 +57,29 @@ _MESSAGE_COLUMNS = (
 )
 _LIVE_ROWS = "IFNULL(Message_MarkedForDelete, 0) = 0"
 _BUSY_RETRIES = 3
+
+_PREFIX_RE = re.compile(r"^\s*(?:(?:re|fw|fwd|aw|sv|wg)\s*:\s*)+", re.IGNORECASE)
+
+
+def normalize_subject(subject: str) -> str:
+    """Subject without leading reply/forward prefixes, as Outlook stores it."""
+    return _PREFIX_RE.sub("", subject or "").strip()
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %ss", name, raw, default)
+    return default
+
+
+# Deadline for one SQL query. A query that runs past it is interrupted and
+# reported as OutlookDBError so the caller falls back to AppleScript instead
+# of hanging the tool call.
+DB_TIMEOUT = _env_seconds("OUTLOOK_MCP_DB_TIMEOUT", 20)
 
 
 class OutlookDBError(RuntimeError):
@@ -96,11 +121,20 @@ def _iso(ts) -> str:
         return ""
 
 
+def _interrupt(con: sqlite3.Connection) -> None:
+    """Timer callback: abort the running statement on this connection."""
+    try:
+        con.interrupt()
+    except sqlite3.ProgrammingError:
+        pass  # connection already closed
+
+
 class OutlookDB:
     """Read-only queries against one Outlook profile database."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, timeout: float = DB_TIMEOUT):
         self.path = path
+        self.timeout = timeout
 
     def _connect(self) -> sqlite3.Connection:
         uri = f"file:{quote(self.path)}?mode=ro"
@@ -111,14 +145,20 @@ class OutlookDB:
     def _query(self, sql: str, params=()) -> list[sqlite3.Row]:
         last = None
         for attempt in range(_BUSY_RETRIES):
+            con = None
+            timer = None
             try:
                 con = self._connect()
-                try:
-                    return con.execute(sql, params).fetchall()
-                finally:
-                    con.close()
+                timer = threading.Timer(self.timeout, _interrupt, (con,))
+                timer.daemon = True
+                timer.start()
+                return con.execute(sql, params).fetchall()
             except sqlite3.OperationalError as e:
                 msg = str(e).lower()
+                if "interrupted" in msg:
+                    raise OutlookDBError(
+                        f"Outlook database query exceeded {self.timeout:g}s"
+                    ) from e
                 if "locked" in msg or "busy" in msg:
                     last = e
                     time.sleep(0.2 * (attempt + 1))
@@ -126,6 +166,11 @@ class OutlookDB:
                 raise OutlookDBError(f"Outlook database query failed: {e}") from e
             except sqlite3.DatabaseError as e:
                 raise OutlookDBError(f"Outlook database unusable: {e}") from e
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                if con is not None:
+                    con.close()
         raise OutlookDBError(f"Outlook database busy: {last}")
 
     # --- folders -------------------------------------------------------
@@ -192,25 +237,71 @@ class OutlookDB:
         rows = self._query(
             f"SELECT {_MESSAGE_COLUMNS} FROM Mail "
             f"WHERE Record_FolderID = ? AND {_LIVE_ROWS}{unread} "
-            "ORDER BY Message_TimeReceived DESC LIMIT ?",
+            "ORDER BY Message_TimeReceived DESC, Record_RecordID DESC LIMIT ?",
             (folder_id, max(0, int(count))),
         )
         return [self._row_to_summary(r) for r in rows]
 
-    def search_messages(self, folder_id: int, query: str, count: int) -> list[dict]:
-        """Case-insensitive substring search over subject, sender, and preview."""
-        query = query.strip()
-        if not query:
-            return []
-        pattern = _like_pattern(query)
+    def find_sent_copy(self, folder_id: int, subject: str, since: int) -> dict | None:
+        """Newest live row in folder with this normalized subject received at or after `since`.
+
+        Used right after a send: Outlook keeps the message in the Outbox for
+        a few seconds and then writes a new Sent Items row, so the caller
+        polls this until it returns a row.
+        """
         rows = self._query(
             f"SELECT {_MESSAGE_COLUMNS} FROM Mail "
-            f"WHERE Record_FolderID = ? AND {_LIVE_ROWS} AND ("
-            "Message_NormalizedSubject LIKE ? ESCAPE '\\' OR "
-            "Message_SenderList LIKE ? ESCAPE '\\' OR "
-            "Message_SenderAddressList LIKE ? ESCAPE '\\' OR "
-            "Message_Preview LIKE ? ESCAPE '\\') "
-            "ORDER BY Message_TimeReceived DESC LIMIT ?",
-            (folder_id, pattern, pattern, pattern, pattern, max(0, int(count))),
+            f"WHERE Record_FolderID = ? AND {_LIVE_ROWS} "
+            "AND Message_NormalizedSubject = ? COLLATE NOCASE "
+            "AND IFNULL(Message_TimeReceived, 0) >= ? "
+            "ORDER BY Message_TimeReceived DESC, Record_RecordID DESC LIMIT 1",
+            (folder_id, normalize_subject(subject), int(since)),
+        )
+        return self._row_to_summary(rows[0]) if rows else None
+
+    def search_messages(self, folder_id: int, query: str, count: int,
+                        recipient: str = "", sender: str = "") -> list[dict]:
+        """Case-insensitive substring search.
+
+        `query` matches subject, sender name, sender address and the preview
+        (first 255 characters of the body). `recipient` matches the To and
+        CC address lists and the display-To names. `sender` matches sender
+        name and address. All given criteria must match.
+        """
+        clauses: list[str] = []
+        params: list = [folder_id]
+        query, recipient, sender = query.strip(), recipient.strip(), sender.strip()
+        if query:
+            p = _like_pattern(query)
+            clauses.append(
+                "(Message_NormalizedSubject LIKE ? ESCAPE '\\' OR "
+                "Message_SenderList LIKE ? ESCAPE '\\' OR "
+                "Message_SenderAddressList LIKE ? ESCAPE '\\' OR "
+                "Message_Preview LIKE ? ESCAPE '\\')"
+            )
+            params += [p] * 4
+        if recipient:
+            p = _like_pattern(recipient)
+            clauses.append(
+                "(IFNULL(Message_ToRecipientAddressList, '') LIKE ? ESCAPE '\\' OR "
+                "IFNULL(Message_CCRecipientAddressList, '') LIKE ? ESCAPE '\\' OR "
+                "IFNULL(Message_DisplayTo, '') LIKE ? ESCAPE '\\')"
+            )
+            params += [p] * 3
+        if sender:
+            p = _like_pattern(sender)
+            clauses.append(
+                "(IFNULL(Message_SenderList, '') LIKE ? ESCAPE '\\' OR "
+                "IFNULL(Message_SenderAddressList, '') LIKE ? ESCAPE '\\')"
+            )
+            params += [p] * 2
+        if not clauses:
+            return []
+        params.append(max(0, int(count)))
+        rows = self._query(
+            f"SELECT {_MESSAGE_COLUMNS} FROM Mail "
+            f"WHERE Record_FolderID = ? AND {_LIVE_ROWS} AND " + " AND ".join(clauses) +
+            " ORDER BY Message_TimeReceived DESC, Record_RecordID DESC LIMIT ?",
+            params,
         )
         return [self._row_to_summary(r) for r in rows]

@@ -14,6 +14,7 @@ import json
 import asyncio
 import sqlite3
 import tempfile
+import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -63,7 +64,7 @@ FOLDERS = [
 T0 = 1788400000  # 2026-09-03 local
 
 MAIL = [
-    # id, folder, subject, sender name, sender addr, preview, read, att, time, del, hidden
+    # id, folder, subject, sender name, sender addr, preview, read, att, time, del, hidden[, to addrs, cc addrs, display to]
     (201, 115, "Quarterly budget report", "Alice", "alice@x.com", "Numbers attached", 0, 1, T0 + 300, 0, 0),
     (202, 115, "Lunch plans", "Bob", "bob@x.com", "Pizza?", 1, 0, T0 + 200, 0, 0),
     (203, 115, "Sandbox access", "Carol", "carol@x.com", "Your sandbox is ready", 0, 0, T0 + 100, 0, 0),
@@ -97,12 +98,16 @@ def build_fixture(dir_path, mail=MAIL, folders=FOLDERS):
             Message_HasAttachment INTEGER,
             Message_TimeReceived INTEGER,
             Message_MarkedForDelete INTEGER,
-            Message_Hidden INTEGER
+            Message_Hidden INTEGER,
+            Message_ToRecipientAddressList TEXT,
+            Message_CCRecipientAddressList TEXT,
+            Message_DisplayTo TEXT
         );
         CREATE INDEX MailIndex_TimeWindow ON Mail (Record_FolderID, Message_TimeReceived DESC);
     """)
     con.executemany("INSERT INTO Folders VALUES (?,?,?,?,?,?)", folders)
-    con.executemany("INSERT INTO Mail VALUES (?,?,?,?,?,?,?,?,?,?,?)", mail)
+    con.executemany("INSERT INTO Mail VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [tuple(row) + (None,) * (14 - len(row)) for row in mail])
     con.commit()
     con.close()
     return path
@@ -277,6 +282,11 @@ class FakeBridge:
         self.scripts = []
         self.output = output
 
+    async def start(self):
+        # Mirrors AppleScriptBridge.start(): one version probe under STARTUP_TIMEOUT.
+        await self.run('tell application "Microsoft Outlook" to get version',
+                       timeout=server_mac.STARTUP_TIMEOUT)
+
     async def run(self, script, timeout=None):
         self.scripts.append(script)
         return self.output
@@ -379,18 +389,15 @@ def test_server_folder_ref_uses_db_id():
 
 
 def test_server_trust_check():
-    log("--- startup trust check compares database inbox with AppleScript ---")
+    log("--- trust check compares database inbox with AppleScript ---")
     with tempfile.TemporaryDirectory() as d:
         db = OutlookDB(build_fixture(d))
-        # AppleScript agrees: folder 115 exists and has 4 messages.
         fake = FakeBridge(output="Inbox|||4")
         server_mac.bridge = fake
         check("agreeing counts -> trusted", asyncio.run(server_mac._trust_db(db)) is True)
         check("probe asks for folder id 115", "mail folder id 115" in fake.scripts[0])
-        # Small drift (mail arrived during startup) is fine.
         server_mac.bridge = FakeBridge(output="Inbox|||6")
         check("small drift -> trusted", asyncio.run(server_mac._trust_db(db)) is True)
-        # Stale legacy database: AppleScript sees a very different mailbox.
         server_mac.bridge = FakeBridge(output="Inbox|||900")
         check("large drift -> untrusted", asyncio.run(server_mac._trust_db(db)) is False)
 
@@ -402,8 +409,237 @@ def test_server_trust_check():
         check("folder id unknown to AppleScript -> untrusted",
               asyncio.run(server_mac._trust_db(db)) is False)
 
+        class SlowBridge(FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self.timeouts = []
+
+            async def run(self, script, timeout=None):
+                self.timeouts.append(timeout)
+                raise RuntimeError(f"AppleScript timed out after {timeout}s")
+
+        slow = SlowBridge()
+        server_mac.bridge = slow
+        check("AppleScript timeout -> undecided (None)", asyncio.run(server_mac._trust_db(db)) is None)
+        check("probe uses the startup timeout", slow.timeouts == [server_mac.STARTUP_TIMEOUT],
+              str(slow.timeouts))
+
+
+def _reset_db_state():
+    server_mac.db = None
+    server_mac._db_candidate = None
+    server_mac._db_state = "none"
+    server_mac._db_lock = None
+
+
+def test_server_trust_check_is_deferred_to_first_use():
+    log("--- trust check runs on first database use, not at startup ---")
+    with tempfile.TemporaryDirectory() as d:
+        path = build_fixture(d)
+        os.environ[outlook_db.ENV_VAR] = path
+        try:
+            _reset_db_state()
+
+            class VersionBridge(FakeBridge):
+                async def run(self, script, timeout=None):
+                    self.scripts.append(script)
+                    return "16.93.2"
+
+            vb = VersionBridge()
+            server_mac.bridge = vb
+            asyncio.run(server_mac.startup())
+            check("startup ran only the version probe", len(vb.scripts) == 1 and "version" in vb.scripts[0])
+            check("startup leaves db unset", server_mac.db is None)
+            check("state is unchecked", server_mac._db_state == "unchecked")
+
+            # First use: AppleScript busy -> timeout -> stays unchecked, tool still answers.
+            class SlowBridge(FakeBridge):
+                async def run(self, script, timeout=None):
+                    self.scripts.append(script)
+                    raise RuntimeError(f"AppleScript timed out after {timeout}s")
+
+            server_mac.bridge = SlowBridge()
+            fid = asyncio.run(server_mac._db_folder_id("inbox"))
+            check("timeout keeps state unchecked", server_mac._db_state == "unchecked")
+            check("no folder id while undecided", fid is None)
+
+            # Next use: AppleScript agrees -> trusted, and stays trusted.
+            server_mac.bridge = FakeBridge(output="Inbox|||4")
+            fid = asyncio.run(server_mac._db_folder_id("inbox"))
+            check("agreement -> trusted", server_mac._db_state == "trusted" and server_mac.db is not None)
+            check("folder id resolved from database", fid == 115)
+            server_mac.bridge = FakeBridge(output="Inbox|||900")
+            fid = asyncio.run(server_mac._db_folder_id("inbox"))
+            check("trusted verdict is cached", fid == 115 and len(server_mac.bridge.scripts) == 0)
+
+            # Mismatch on first use -> untrusted, cached, AppleScript not asked again.
+            _reset_db_state()
+            server_mac.bridge = VersionBridge()
+            asyncio.run(server_mac.startup())
+            bad = FakeBridge(output="Inbox|||900")
+            server_mac.bridge = bad
+            asyncio.run(server_mac._db_folder_id("inbox"))
+            check("mismatch -> untrusted", server_mac._db_state == "untrusted")
+            asyncio.run(server_mac._db_folder_id("inbox"))
+            check("untrusted verdict is cached", len(bad.scripts) == 1)
+        finally:
+            del os.environ[outlook_db.ENV_VAR]
+            _reset_db_state()
+
+
+def test_ping_tool():
+    log("--- ping reports Outlook reachability and database state ---")
+    _reset_db_state()
+    fake = FakeBridge(output="16.93.2")
+    server_mac.bridge = fake
+    result = json.loads(asyncio.run(server_mac.ping()))
+    check("ok when Outlook answers", result["ok"] is True, str(result))
+    check("reports version", result["outlook_version"] == "16.93.2")
+    check("reports db state", result["db"] == "none")
+    check("reports uptime", isinstance(result["uptime_s"], int))
+    check("reports server version", isinstance(result["server_version"], str) and result["server_version"])
+    check("applescript_ms measured", isinstance(result["applescript_ms"], int))
+
+    class DeadBridge(FakeBridge):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        async def run(self, script, timeout=None):
+            self.timeouts.append(timeout)
+            raise RuntimeError("AppleScript timed out after 10s")
+
+    dead = DeadBridge()
+    server_mac.bridge = dead
+    result = json.loads(asyncio.run(server_mac.ping()))
+    check("not ok when Outlook is silent", result["ok"] is False)
+    check("error carried", "timed out" in result.get("error", ""))
+    check("ping uses the short startup timeout", dead.timeouts == [server_mac.STARTUP_TIMEOUT])
+    names = [t.name for t in asyncio.run(server_mac.mcp.list_tools())]
+    check("ping is registered as a tool", "ping" in names)
+
+
+def test_query_deadline_interrupts_long_query():
+    log("--- a query past the deadline is interrupted and raises OutlookDBError ---")
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d), timeout=0.2)
+        t0 = time.time()
+        try:
+            db._query("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
+                      "SELECT COUNT(*) FROM c")
+            check("raised OutlookDBError", False, "query finished")
+        except outlook_db.OutlookDBError as e:
+            check("raised OutlookDBError", "exceeded" in str(e), str(e))
+        check("returned promptly", time.time() - t0 < 2.0, f"{time.time() - t0:.2f}s")
+        check("normal query still works", db.resolve_folder("inbox") == 115)
+    check("default deadline is 20s", outlook_db.DB_TIMEOUT == 20.0, str(outlook_db.DB_TIMEOUT))
+
+
+def test_list_messages_tie_breaks_on_record_id():
+    log("--- equal timestamps are ordered by record id, newest first ---")
+    mail = MAIL + [
+        (301, 115, "Same second A", "A", "a@x.com", "", 0, 0, T0 + 500, 0, 0),
+        (302, 115, "Same second B", "B", "b@x.com", "", 0, 0, T0 + 500, 0, 0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d, mail=mail))
+        ids = [r["entry_id"] for r in db.list_messages(115, 2)]
+        check("newest record first among equals", ids == ["302", "301"], str(ids))
+
+
+def test_normalize_subject():
+    log("--- normalize_subject strips reply and forward prefixes ---")
+    check("RE:", outlook_db.normalize_subject("RE: budget") == "budget")
+    check("nested", outlook_db.normalize_subject("Re: FW: Fwd: budget") == "budget")
+    check("plain", outlook_db.normalize_subject("  budget  ") == "budget")
+    check("inner Re kept", outlook_db.normalize_subject("Re: about the Re: thing") == "about the Re: thing")
+
+
+def test_find_sent_copy():
+    log("--- find_sent_copy returns the newest matching sent row after `since` ---")
+    mail = MAIL + [
+        (401, 127, "budget", "Me", "me@x.com", "older reply", 1, 0, T0 + 1000, 0, 0),
+        (402, 127, "budget", "Me", "me@x.com", "newer reply", 1, 0, T0 + 2000, 0, 0),
+        (403, 127, "budget", "Me", "me@x.com", "deleted", 1, 0, T0 + 3000, 1, 0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d, mail=mail))
+        row = db.find_sent_copy(127, "RE: budget", since=T0 + 1500)
+        check("newest live row after since", row is not None and row["entry_id"] == "402", str(row))
+        check("older rows ignored", db.find_sent_copy(127, "budget", since=T0 + 2500) is None)
+        check("case-insensitive subject", db.find_sent_copy(127, "BUDGET", since=T0) is not None)
+        check("other folder ignored", db.find_sent_copy(115, "budget", since=T0) is None)
+
+
+def test_server_send_email_confirms_sent_copy():
+    log("--- send_email and reply_email report the Sent Items id ---")
+    with tempfile.TemporaryDirectory() as d:
+        mail = MAIL + [(501, 127, "Hello there", "Me", "me@x.com", "", 1, 0, int(time.time()) + 5, 0, 0)]
+        server_mac.db = OutlookDB(build_fixture(d, mail=mail))
+        server_mac.bridge = FakeBridge(output="")
+        result = asyncio.run(server_mac.send_email(to="a@x.com", subject="Hello there", body="hi"))
+        check("send confirmation carries the Sent Items id", result.endswith("(Sent Items id 501)"), result)
+        server_mac.bridge = FakeBridge(output="RE: Hello there")
+        result = asyncio.run(server_mac.reply_email(entry_id="1", body="hi"))
+        check("reply confirmation carries the Sent Items id", result.endswith("(Sent Items id 501)"), result)
+
+        old = server_mac._SENT_CONFIRM_TIMEOUT
+        server_mac._SENT_CONFIRM_TIMEOUT = 0.6
+        try:
+            t0 = time.time()
+            result = asyncio.run(server_mac.send_email(to="a@x.com", subject="Never lands", body="hi"))
+            check("missing copy reported", result.endswith("(Sent Items copy not visible yet; verify with search_emails)"), result)
+            check("gives up after the confirm timeout", 0.5 < time.time() - t0 < 3.0, f"{time.time() - t0:.2f}s")
+        finally:
+            server_mac._SENT_CONFIRM_TIMEOUT = old
+    server_mac.db = None
+
+
+def test_search_by_recipient_and_sender():
+    log("--- search filters by recipient and sender ---")
+    mail = MAIL + [
+        (601, 115, "New Service Integration - Kunim", "Derrick", "derrick@x.com", "please approve",
+         0, 0, T0 + 600, 0, 0, "edward@x.com", "isdemand@x.com", "Edward Adjei"),
+        (602, 115, "Weekly digest", "News", "news@x.com", "approve nothing",
+         0, 0, T0 + 700, 0, 0, "all@x.com", "", "Everyone"),
+        (603, 115, "Approval request", "Derrick", "derrick@x.com", "second one",
+         0, 0, T0 + 800, 0, 0, "bob@x.com", "edward@x.com", "Bob"),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d, mail=mail))
+        ids = lambda rows: [r["entry_id"] for r in rows]
+        check("recipient matches to and cc", ids(db.search_messages(115, "", 10, recipient="edward")) == ["603", "601"])
+        check("recipient matches display name", ids(db.search_messages(115, "", 10, recipient="Adjei")) == ["601"])
+        check("query AND recipient", ids(db.search_messages(115, "approv", 10, recipient="edward")) == ["603", "601"])
+        check("sender filter", ids(db.search_messages(115, "", 10, sender="derrick")) == ["603", "601"])
+        check("all three combined", ids(db.search_messages(115, "kunim", 10, recipient="edward", sender="derrick")) == ["601"])
+        check("nothing given -> empty", db.search_messages(115, "", 10) == [])
+        check("rows without recipient columns filled do not match", ids(db.search_messages(115, "", 10, recipient="x.com")) == ["603", "602", "601"])
+
+
+def test_server_search_emails_filters():
+    log("--- search_emails passes recipient and sender to the database ---")
+    _reset_db_state()
+    with tempfile.TemporaryDirectory() as d:
+        mail = MAIL + [(701, 115, "Approve me please", "Derrick", "derrick@x.com", "", 0, 0, T0 + 900, 0, 0,
+                        "edward@x.com", "", "Edward")]
+        server_mac.db = OutlookDB(build_fixture(d, mail=mail))
+        server_mac.bridge = FakeBridge(output="")
+        rows = json.loads(asyncio.run(server_mac.search_emails(query="approve", recipient="edward")))
+        check("filtered hit", [r["entry_id"] for r in rows] == ["701"], str(rows))
+        rows = json.loads(asyncio.run(server_mac.search_emails(recipient="edward")))
+        check("recipient alone works", [r["entry_id"] for r in rows] == ["701"], str(rows))
+        result = json.loads(asyncio.run(server_mac.search_emails()))
+        check("no criteria -> error", "error" in result, str(result))
+        # Filters need the database; the AppleScript fallback cannot honour them.
+        server_mac.db = None
+        result = json.loads(asyncio.run(server_mac.search_emails(query="approve", recipient="edward")))
+        check("filters without database -> error, not a silent subject search", "error" in result and "recipient" in result["error"], str(result))
+    _reset_db_state()
+
 
 def main():
+    server_mac._SENT_CONFIRM_TIMEOUT = 0.0  # unit tests never wait for Outlook's Sent Items write
     test_locate_missing_file()
     test_locate_env_override()
     test_resolve_builtin_folders_prefer_exchange()
@@ -425,6 +661,15 @@ def main():
     test_server_no_db_uses_applescript()
     test_server_folder_ref_uses_db_id()
     test_server_trust_check()
+    test_server_trust_check_is_deferred_to_first_use()
+    test_ping_tool()
+    test_query_deadline_interrupts_long_query()
+    test_list_messages_tie_breaks_on_record_id()
+    test_normalize_subject()
+    test_find_sent_copy()
+    test_server_send_email_confirms_sent_copy()
+    test_search_by_recipient_and_sender()
+    test_server_search_emails_filters()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")

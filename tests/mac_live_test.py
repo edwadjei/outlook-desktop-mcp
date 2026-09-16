@@ -1,0 +1,146 @@
+"""
+Outlook Desktop MCP - macOS live send/reply test
+=================================================
+Opt-in end-to-end test against the running Outlook app. Sends one seed
+message to a scratch address that delivers back into this mailbox, waits
+for the inbox copy, replies to it with reply_all=False and reply_all=True,
+and asserts every sent item shows up in Sent Items.
+
+Environment:
+  OUTLOOK_MCP_LIVE_SCRATCH   address to send to (required; otherwise SKIP)
+  OUTLOOK_MCP_LIVE_INLINE_ID message id with an inline image (optional)
+
+Run: ~/.mcp-venvs/outlook-desktop/bin/python tests/mac_live_test.py
+Requires Outlook for Mac in legacy mode with the account signed in.
+"""
+import sys
+import os
+import json
+import asyncio
+import re
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from outlook_desktop_mcp import server_mac
+
+SCRATCH = os.environ.get("OUTLOOK_MCP_LIVE_SCRATCH", "").strip()
+INLINE_ID = os.environ.get("OUTLOOK_MCP_LIVE_INLINE_ID", "").strip()
+ROUND_TRIP = 120  # seconds allowed for an Exchange round trip
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+passed = 0
+total = 0
+
+
+def check(name, condition, detail=""):
+    global passed, total
+    total += 1
+    if condition:
+        passed += 1
+        log(f"  PASS: {name}")
+    else:
+        log(f"  FAIL: {name} {detail}")
+
+
+async def matches(folder, subject):
+    """Messages in folder whose subject (ignoring Re:/Fw:) equals subject."""
+    raw = await server_mac.search_emails(query=subject, folder=folder, count=20)
+    rows = json.loads(raw)
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if r.get("subject", "").strip().lower() == subject.lower()]
+
+
+async def wait_for_count(folder, subject, minimum, timeout=ROUND_TRIP):
+    """Poll until at least `minimum` matching messages are in folder."""
+    deadline = time.time() + timeout
+    while True:
+        rows = await matches(folder, subject)
+        if len(rows) >= minimum or time.time() >= deadline:
+            return rows
+        await asyncio.sleep(3)
+
+
+async def start_server():
+    await server_mac.startup()
+    await server_mac._ensure_db()
+    log(f"  database: {server_mac._db_state}")
+    check("database trusted for the live test", server_mac._db_state == "trusted")
+
+
+async def check_sent_copy(result, subject):
+    """The confirmation names a Sent Items id, and that id reads back."""
+    m = re.search(r"\(Sent Items id (\d+)\)", result)
+    check("confirmation names the Sent Items id", m is not None, result)
+    if m:
+        copy = json.loads(await server_mac.read_email(entry_id=m.group(1)))
+        check("Sent Items id readable", copy.get("subject", "").lower().endswith(subject.lower()), str(copy)[:200])
+
+
+async def run():
+    await start_server()
+    if server_mac._db_state != "trusted":
+        return  # subject matching below needs the database; fail fast, do not poll for minutes
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subject = f"[MCP live test {stamp}] reply regression"
+
+    log("--- seed message ---")
+    result = await server_mac.send_email(
+        to=SCRATCH, subject=subject,
+        body="Seed for the reply regression test. Safe to delete.\n\nBr,\nEdward.")
+    check("send_email reported success", result.startswith("Email sent"), result)
+    await check_sent_copy(result, subject)
+    sent = await wait_for_count("sent", subject, 1)
+    check("seed appears in Sent Items", len(sent) >= 1)
+    received = await wait_for_count("inbox", subject, 1)
+    check("seed delivered to inbox", len(received) >= 1)
+    if not received:
+        return
+    seed_id = received[0]["entry_id"]
+
+    log("--- replies ---")
+    expected_sent = 1
+    for reply_all in (False, True):
+        result = await server_mac.reply_email(
+            entry_id=seed_id, reply_all=reply_all,
+            body=f"Reply with reply_all={reply_all}. Safe to delete.\n\nBr,\nEdward.")
+        check(f"reply_all={reply_all}: reply_email reported success",
+              result.startswith("Reply sent"), result)
+        await check_sent_copy(result, subject)
+        expected_sent += 1
+        sent = await wait_for_count("sent", subject, expected_sent)
+        check(f"reply_all={reply_all}: reply appears in Sent Items",
+              len(sent) >= expected_sent, f"{len(sent)} in Sent Items")
+
+    if INLINE_ID:
+        log("--- inline image save ---")
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            raw = await server_mac.save_attachment(entry_id=INLINE_ID, attachment_index=1, save_directory=d)
+            try:
+                saved = json.loads(raw)
+            except ValueError:
+                saved = {"error": raw}
+            check("inline attachment saved", saved.get("status") == "saved", raw)
+            check("file has bytes", saved.get("bytes", 0) > 0, raw)
+
+
+def main():
+    if not SCRATCH:
+        log("SKIP: set OUTLOOK_MCP_LIVE_SCRATCH to run the live test")
+        return
+    asyncio.run(run())
+    log("=" * 50)
+    log(f"{passed}/{total} checks passed")
+    if passed != total:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

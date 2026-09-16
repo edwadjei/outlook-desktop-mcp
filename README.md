@@ -115,8 +115,9 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 |------|:-------:|:-----:|-------------|
 | `send_email` | yes | yes | Send an email with To/CC/BCC; `html_body` recommended, plain `body` auto-converted to HTML |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
+| `ping` | no | yes | Liveness check: Outlook version, AppleScript round-trip time, database state; answers within 10 s |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies (macOS: subject, sender, and preview via the local message index) |
+| `search_emails` | yes | yes | Search by keyword (Windows: full text). macOS: also filters by `recipient` and `sender`; keyword matching covers subject, sender and the first 255 characters of the body only |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread; accepts `html_body` |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
@@ -206,6 +207,8 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
 - Dates passed to AppleScript are built by component assignment (`set year of d to 2026`, ...) rather than `date "..."` literals, which osascript parses according to the system locale and can silently turn `"2026-09-01 07:00"` into a date in 2007.
 
+**Every call is bounded.** Each AppleScript runs under `OUTLOOK_MCP_SCRIPT_TIMEOUT` (default 120 s) and each profile-database query under `OUTLOOK_MCP_DB_TIMEOUT` (default 20 s); a query past its deadline is interrupted and the tool falls back to AppleScript. A list or search call therefore never runs longer than about 260 s (database, batched script, legacy script), and most finish in well under a second. The database trust check runs on the first list or search call rather than at startup, so the server connects instantly even when Outlook is busy serving another client's script. Use `ping` to confirm Outlook is answering before a long task.
+
 #### Fast list and search on macOS (`outlook_db.py`)
 
 AppleScript's `whose` clause makes Outlook walk every message in the folder, one Apple Event at a time. On a mailbox with tens of thousands of messages a single search exceeds the script timeout, and because Outlook runs one script at a time it stalls every other tool while it runs. Legacy Outlook for Mac keeps all message metadata in a SQLite database under its profile directory, and its AppleScript layer reads from that same store, so the numeric `Record_RecordID` in the database is exactly the `id` AppleScript uses.
@@ -213,15 +216,16 @@ AppleScript's `whose` clause makes Outlook walk every message in the folder, one
 `list_emails` and `search_emails` therefore query that database directly, read-only:
 
 - Listing and searching a 33,000-message inbox takes milliseconds instead of minutes.
-- Search matches subject, sender name, sender address, and the message preview, and ignores `Re:`/`FW:` prefixes (the database stores a normalized subject, so results show the subject without those prefixes).
+- `search_emails` keyword matching covers the subject, sender name, sender address, and the message preview (the first 255 characters of the body), and ignores `Re:`/`FW:` prefixes (the database stores a normalized subject, so results show the subject without those prefixes). Bodies are not indexed, so a keyword sweep can miss requests whose key word sits lower in the message. Combine it with `recipient="<your name or address>"` to list everything addressed to you, then `read_email` the candidates.
 - Folder names are resolved through the database's folder table, which also fixes the `inbox` keyword resolving to the empty local "On My Computer" store on Exchange profiles; action tools then address folders by id.
 - The ids returned are the same ones `read_email`, `reply_email`, `move_email`, and the mark tools use through AppleScript.
+- A message you just sent sits in the Outbox for a few seconds, then Outlook writes a new Sent Items record with a new id. `send_email` and `reply_email` wait up to 10 s for that record and name it in their confirmation (`(Sent Items id N)`); `list_emails(folder="sent")` called inside that window will not show it yet. Verify sends by the confirmation id or `search_emails`, not by the top of `list_emails`.
 
 Safety and fallback:
 
 - The database is opened with `mode=ro`; nothing is ever written, and reads never block Outlook.
-- At startup the server asks AppleScript for the message count of the folder the database calls the inbox. If the id is unknown to AppleScript or the counts diverge (a stale database left behind after switching to New Outlook), the database is not used.
-- If the database is missing (New Outlook, no profile yet), busy, or has an unexpected schema, or a folder name is not found in it, the tool falls back to the AppleScript path above. Search then matches subject only.
+- On the first list or search call (not at startup) the server asks AppleScript for the message count of the folder the database calls the inbox. If the id is unknown to AppleScript or the counts diverge (a stale database left behind after switching to New Outlook), the database is not used.
+- If the database is missing (New Outlook, no profile yet), busy, or has an unexpected schema, or a folder name is not found in it, the tool falls back to the AppleScript path above. Search then matches subject only, and `recipient`/`sender` filters return an error instead of silently searching without them.
 - `OUTLOOK_MCP_DB_PATH` overrides the database location. The default is `~/Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles/<profile>/Data/Outlook.sqlite`, preferring `Main Profile`.
 
 `python tests/mac_db_test.py` covers the database layer and its integration against a fixture database, without Outlook.
