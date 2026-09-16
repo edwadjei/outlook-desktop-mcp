@@ -1,9 +1,10 @@
 ---
 id: TASK-2
 title: 'Bound database queries, defer trust check, add ping tool'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-09-16 08:26'
+updated_date: '2026-09-16 08:34'
 labels:
   - macos
   - bug
