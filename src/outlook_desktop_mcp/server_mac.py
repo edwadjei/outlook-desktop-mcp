@@ -993,8 +993,9 @@ else
 end if
 tell application "Microsoft Outlook"
     set content of replyMsg to newContent
+    set sentSubject to subject of replyMsg
     send replyMsg
-    return subject of replyMsg
+    return sentSubject
 end tell'''
 
     try:

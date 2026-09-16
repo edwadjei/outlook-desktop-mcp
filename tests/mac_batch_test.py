@@ -531,9 +531,14 @@ def test_reply_email_uses_dictionary_reply_command():
         expected = ("set replyMsg to reply to m with reply to all without opening window"
                     if reply_all else "set replyMsg to reply to m without opening window")
         check(f"reply_all={reply_all}: reply command", expected in script, script[:400])
-        check(f"reply_all={reply_all}: returns the subject actually sent",
-              "return subject of replyMsg" in script and "return msubject" not in script,
-              script[-200:])
+        read_at = script.find("set sentSubject to subject of replyMsg")
+        send_at = script.find("send replyMsg")
+        check(f"reply_all={reply_all}: subject read into a variable before send",
+              read_at != -1 and send_at != -1 and read_at < send_at
+              and "return sentSubject" in script
+              and "return subject of replyMsg" not in script
+              and "return msubject" not in script,
+              script[-250:])
         if _outlook_running():
             ok, err = _compiles(script)
             check(f"reply_all={reply_all}: script compiles against Outlook", ok, err)
