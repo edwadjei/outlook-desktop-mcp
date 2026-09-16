@@ -259,20 +259,49 @@ class OutlookDB:
         )
         return self._row_to_summary(rows[0]) if rows else None
 
-    def search_messages(self, folder_id: int, query: str, count: int) -> list[dict]:
-        """Case-insensitive substring search over subject, sender, and preview."""
-        query = query.strip()
-        if not query:
+    def search_messages(self, folder_id: int, query: str, count: int,
+                        recipient: str = "", sender: str = "") -> list[dict]:
+        """Case-insensitive substring search.
+
+        `query` matches subject, sender name, sender address and the preview
+        (first 255 characters of the body). `recipient` matches the To and
+        CC address lists and the display-To names. `sender` matches sender
+        name and address. All given criteria must match.
+        """
+        clauses: list[str] = []
+        params: list = [folder_id]
+        query, recipient, sender = query.strip(), recipient.strip(), sender.strip()
+        if query:
+            p = _like_pattern(query)
+            clauses.append(
+                "(Message_NormalizedSubject LIKE ? ESCAPE '\\' OR "
+                "Message_SenderList LIKE ? ESCAPE '\\' OR "
+                "Message_SenderAddressList LIKE ? ESCAPE '\\' OR "
+                "Message_Preview LIKE ? ESCAPE '\\')"
+            )
+            params += [p] * 4
+        if recipient:
+            p = _like_pattern(recipient)
+            clauses.append(
+                "(IFNULL(Message_ToRecipientAddressList, '') LIKE ? ESCAPE '\\' OR "
+                "IFNULL(Message_CCRecipientAddressList, '') LIKE ? ESCAPE '\\' OR "
+                "IFNULL(Message_DisplayTo, '') LIKE ? ESCAPE '\\')"
+            )
+            params += [p] * 3
+        if sender:
+            p = _like_pattern(sender)
+            clauses.append(
+                "(IFNULL(Message_SenderList, '') LIKE ? ESCAPE '\\' OR "
+                "IFNULL(Message_SenderAddressList, '') LIKE ? ESCAPE '\\')"
+            )
+            params += [p] * 2
+        if not clauses:
             return []
-        pattern = _like_pattern(query)
+        params.append(max(0, int(count)))
         rows = self._query(
             f"SELECT {_MESSAGE_COLUMNS} FROM Mail "
-            f"WHERE Record_FolderID = ? AND {_LIVE_ROWS} AND ("
-            "Message_NormalizedSubject LIKE ? ESCAPE '\\' OR "
-            "Message_SenderList LIKE ? ESCAPE '\\' OR "
-            "Message_SenderAddressList LIKE ? ESCAPE '\\' OR "
-            "Message_Preview LIKE ? ESCAPE '\\') "
-            "ORDER BY Message_TimeReceived DESC LIMIT ?",
-            (folder_id, pattern, pattern, pattern, pattern, max(0, int(count))),
+            f"WHERE Record_FolderID = ? AND {_LIVE_ROWS} AND " + " AND ".join(clauses) +
+            " ORDER BY Message_TimeReceived DESC, Record_RecordID DESC LIMIT ?",
+            params,
         )
         return [self._row_to_summary(r) for r in rows]

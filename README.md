@@ -117,7 +117,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `ping` | no | yes | Liveness check: Outlook version, AppleScript round-trip time, database state; answers within 10 s |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies (macOS: subject, sender, and preview via the local message index) |
+| `search_emails` | yes | yes | Search by keyword; macOS also filters by `recipient` and `sender`. Keyword matching covers subject, sender and the first 255 characters of the body only |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread; accepts `html_body` |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
@@ -217,6 +217,7 @@ AppleScript's `whose` clause makes Outlook walk every message in the folder, one
 
 - Listing and searching a 33,000-message inbox takes milliseconds instead of minutes.
 - Search matches subject, sender name, sender address, and the message preview, and ignores `Re:`/`FW:` prefixes (the database stores a normalized subject, so results show the subject without those prefixes).
+- `search_emails` keyword matching covers the subject, sender and the message preview (first 255 characters). Bodies are not indexed, so a keyword sweep can miss requests whose key word sits lower in the message. Combine it with `recipient="<your name or address>"` to list everything addressed to you, then `read_email` the candidates.
 - Folder names are resolved through the database's folder table, which also fixes the `inbox` keyword resolving to the empty local "On My Computer" store on Exchange profiles; action tools then address folders by id.
 - The ids returned are the same ones `read_email`, `reply_email`, `move_email`, and the mark tools use through AppleScript.
 - A message you just sent sits in the Outbox for a few seconds, then Outlook writes a new Sent Items record with a new id. `send_email` and `reply_email` wait up to 10 s for that record and name it in their confirmation (`(Sent Items id N)`); `list_emails(folder="sent")` called inside that window will not show it yet. Verify sends by the confirmation id or `search_emails`, not by the top of `list_emails`.

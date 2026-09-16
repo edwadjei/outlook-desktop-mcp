@@ -64,7 +64,7 @@ FOLDERS = [
 T0 = 1788400000  # 2026-09-03 local
 
 MAIL = [
-    # id, folder, subject, sender name, sender addr, preview, read, att, time, del, hidden
+    # id, folder, subject, sender name, sender addr, preview, read, att, time, del, hidden[, to addrs, cc addrs, display to]
     (201, 115, "Quarterly budget report", "Alice", "alice@x.com", "Numbers attached", 0, 1, T0 + 300, 0, 0),
     (202, 115, "Lunch plans", "Bob", "bob@x.com", "Pizza?", 1, 0, T0 + 200, 0, 0),
     (203, 115, "Sandbox access", "Carol", "carol@x.com", "Your sandbox is ready", 0, 0, T0 + 100, 0, 0),
@@ -98,12 +98,16 @@ def build_fixture(dir_path, mail=MAIL, folders=FOLDERS):
             Message_HasAttachment INTEGER,
             Message_TimeReceived INTEGER,
             Message_MarkedForDelete INTEGER,
-            Message_Hidden INTEGER
+            Message_Hidden INTEGER,
+            Message_ToRecipientAddressList TEXT,
+            Message_CCRecipientAddressList TEXT,
+            Message_DisplayTo TEXT
         );
         CREATE INDEX MailIndex_TimeWindow ON Mail (Record_FolderID, Message_TimeReceived DESC);
     """)
     con.executemany("INSERT INTO Folders VALUES (?,?,?,?,?,?)", folders)
-    con.executemany("INSERT INTO Mail VALUES (?,?,?,?,?,?,?,?,?,?,?)", mail)
+    con.executemany("INSERT INTO Mail VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [tuple(row) + (None,) * (14 - len(row)) for row in mail])
     con.commit()
     con.close()
     return path
@@ -591,6 +595,49 @@ def test_server_send_email_confirms_sent_copy():
     server_mac.db = None
 
 
+def test_search_by_recipient_and_sender():
+    log("--- search filters by recipient and sender ---")
+    mail = MAIL + [
+        (601, 115, "New Service Integration - Kunim", "Derrick", "derrick@x.com", "please approve",
+         0, 0, T0 + 600, 0, 0, "edward@x.com", "isdemand@x.com", "Edward Adjei"),
+        (602, 115, "Weekly digest", "News", "news@x.com", "approve nothing",
+         0, 0, T0 + 700, 0, 0, "all@x.com", "", "Everyone"),
+        (603, 115, "Approval request", "Derrick", "derrick@x.com", "second one",
+         0, 0, T0 + 800, 0, 0, "bob@x.com", "edward@x.com", "Bob"),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d, mail=mail))
+        ids = lambda rows: [r["entry_id"] for r in rows]
+        check("recipient matches to and cc", ids(db.search_messages(115, "", 10, recipient="edward")) == ["603", "601"])
+        check("recipient matches display name", ids(db.search_messages(115, "", 10, recipient="Adjei")) == ["601"])
+        check("query AND recipient", ids(db.search_messages(115, "approv", 10, recipient="edward")) == ["603", "601"])
+        check("sender filter", ids(db.search_messages(115, "", 10, sender="derrick")) == ["603", "601"])
+        check("all three combined", ids(db.search_messages(115, "kunim", 10, recipient="edward", sender="derrick")) == ["601"])
+        check("nothing given -> empty", db.search_messages(115, "", 10) == [])
+        check("rows without recipient columns filled do not match", ids(db.search_messages(115, "", 10, recipient="x.com")) == ["603", "602", "601"])
+
+
+def test_server_search_emails_filters():
+    log("--- search_emails passes recipient and sender to the database ---")
+    _reset_db_state()
+    with tempfile.TemporaryDirectory() as d:
+        mail = MAIL + [(701, 115, "Approve me please", "Derrick", "derrick@x.com", "", 0, 0, T0 + 900, 0, 0,
+                        "edward@x.com", "", "Edward")]
+        server_mac.db = OutlookDB(build_fixture(d, mail=mail))
+        server_mac.bridge = FakeBridge(output="")
+        rows = json.loads(asyncio.run(server_mac.search_emails(query="approve", recipient="edward")))
+        check("filtered hit", [r["entry_id"] for r in rows] == ["701"], str(rows))
+        rows = json.loads(asyncio.run(server_mac.search_emails(recipient="edward")))
+        check("recipient alone works", [r["entry_id"] for r in rows] == ["701"], str(rows))
+        result = json.loads(asyncio.run(server_mac.search_emails()))
+        check("no criteria -> error", "error" in result, str(result))
+        # Filters need the database; the AppleScript fallback cannot honour them.
+        server_mac.db = None
+        result = json.loads(asyncio.run(server_mac.search_emails(query="approve", recipient="edward")))
+        check("filters without database -> error, not a silent subject search", "error" in result and "recipient" in result["error"], str(result))
+    _reset_db_state()
+
+
 def main():
     server_mac._SENT_CONFIRM_TIMEOUT = 0.0  # unit tests never wait for Outlook's Sent Items write
     test_locate_missing_file()
@@ -621,6 +668,8 @@ def main():
     test_normalize_subject()
     test_find_sent_copy()
     test_server_send_email_confirms_sent_copy()
+    test_search_by_recipient_and_sender()
+    test_server_search_emails_filters()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")

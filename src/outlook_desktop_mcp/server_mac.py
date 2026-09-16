@@ -1158,36 +1158,51 @@ end tell'''
 
 @mcp.tool()
 async def search_emails(
-    query: str,
+    query: str = "",
     folder: str = "inbox",
     count: int = 10,
+    recipient: str = "",
+    sender: str = "",
 ) -> str:
-    """Search for emails in Outlook using text search.
+    """Search for emails in Outlook.
 
     On legacy Outlook for Mac the search runs against Outlook's local
-    message index and matches subject, sender name, sender address, and
-    the message preview text. Reply/forward prefixes ("Re:", "FW:") are
-    ignored. If the index is unavailable, the search falls back to
-    AppleScript filtering on subject only.
-    Results include entry_id for further operations.
+    message index. `query` matches the subject, the sender name and
+    address, and the preview, which is only the FIRST 255 CHARACTERS of
+    the body. Full bodies are not indexed: a keyword that appears deeper
+    in a message is not found. To find pending requests reliably, filter
+    by `recipient` (and `sender`) and read candidates with read_email.
+    Reply/forward prefixes ("Re:", "FW:") are ignored.
+
+    If the index is unavailable, `query` falls back to AppleScript
+    filtering on subject only, and `recipient`/`sender` return an error
+    rather than silently searching without them.
 
     Args:
-        query: The search term (case-insensitive substring match).
-            Examples: "budget report", "meeting notes", "alice@example.com".
+        query: Substring for subject, sender and preview. May be empty
+            when recipient or sender is given.
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
+        recipient: Substring matched against To and CC addresses and the
+            displayed To names, e.g. "edward" or "isdemand".
+        sender: Substring matched against the sender name and address.
 
     Returns:
-        JSON array of matching email summaries, or an error.
+        JSON array of matching email summaries, newest first, or an error.
     """
+    if not (query.strip() or recipient.strip() or sender.strip()):
+        return json.dumps({"error": "Provide at least one of query, recipient, sender"})
     fid = await _db_folder_id(folder)
     if fid is not None:
         try:
-            rows = await asyncio.to_thread(db.search_messages, fid, query, count)
+            rows = await asyncio.to_thread(db.search_messages, fid, query, count, recipient, sender)
             return json.dumps(rows, indent=2, default=str)
         except OutlookDBError as e:
             logger.warning("Outlook database search failed; using AppleScript: %s", e)
+    if recipient.strip() or sender.strip():
+        return json.dumps({"error": "recipient and sender filters need Outlook's message index, "
+                                    "which is unavailable right now; retry, or search with query only"})
 
     folder_ref = resolve_folder_ref(folder) if fid is None else f"mail folder id {fid}"
     safe_query = escape(query)
