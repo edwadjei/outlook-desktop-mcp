@@ -2266,7 +2266,8 @@ async def save_attachment(
 ) -> str:
     """Save an attachment from an email to disk.
 
-    Downloads the specified attachment to a local directory.
+    Downloads the specified attachment to a local directory. Inline (pasted)
+    images are supported: they are listed as attachments and saved the same way.
 
     Args:
         entry_id: The numeric ID of the email containing the attachment.
@@ -2276,28 +2277,15 @@ async def save_attachment(
             Downloads folder.
 
     Returns:
-        The full file path where the attachment was saved, or an error.
+        JSON with status, filename, path and bytes, or an error.
     """
     if not save_directory:
         save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(save_directory, exist_ok=True)
 
-    # Use POSIX path for AppleScript
-    save_dir_posix = save_directory
-
-    script = f'''tell application "Microsoft Outlook"
-    set m to message id {entry_id}
-    set attList to attachments of m
-    set attCount to count of attList
-    if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s), requested index {attachment_index}"
-    set a to item {attachment_index} of attList
-    set aname to name of a
-    set savePath to POSIX file "{escape(save_dir_posix)}/{escape("__PLACEHOLDER__")}"
-    save a in file ((POSIX path of (POSIX file "{escape(save_dir_posix)}")) & aname)
-    return aname
-end tell'''
-
-    # Simpler approach: save to known path
+    # `save ... in` takes a file object. A POSIX path *string* is rejected
+    # with -2700 for inline images (which have no `file` of their own), so
+    # build the reference with `POSIX file`.
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set attList to attachments of m
@@ -2305,8 +2293,8 @@ end tell'''
     if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s)"
     set a to item {attachment_index} of attList
     set aname to name of a
-    set savePath to "{escape(save_dir_posix)}/" & aname
-    save a in savePath
+    set savePath to "{escape(save_directory)}/" & aname
+    save a in (POSIX file savePath)
     return aname & "{DELIM}" & savePath
 end tell'''
 
@@ -2314,16 +2302,18 @@ end tell'''
         raw = await bridge.run(script)
         if raw.startswith("ERROR:"):
             return raw
-
         parts = raw.split(DELIM)
-        filename = parts[0].strip() if len(parts) > 0 else "unknown"
+        filename = parts[0].strip() if parts else "unknown"
         save_path = os.path.join(save_directory, filename)
-        result = {
+        if not os.path.isfile(save_path) or os.path.getsize(save_path) == 0:
+            return (f"Error saving attachment: Outlook reported success but no file "
+                    f"was written at {save_path}")
+        return json.dumps({
             "status": "saved",
             "filename": filename,
             "path": save_path,
-        }
-        return json.dumps(result, indent=2, default=str)
+            "bytes": os.path.getsize(save_path),
+        }, indent=2, default=str)
     except Exception as e:
         return f"Error saving attachment: {e}"
 

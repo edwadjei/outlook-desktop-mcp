@@ -118,6 +118,18 @@ async def run():
         check(f"reply_all={reply_all}: reply appears in Sent Items",
               len(sent) >= expected_sent, f"{len(sent)} in Sent Items")
 
+    if INLINE_ID:
+        log("--- inline image save ---")
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            raw = await server_mac.save_attachment(entry_id=INLINE_ID, attachment_index=1, save_directory=d)
+            try:
+                saved = json.loads(raw)
+            except ValueError:
+                saved = {"error": raw}
+            check("inline attachment saved", saved.get("status") == "saved", raw)
+            check("file has bytes", saved.get("bytes", 0) > 0, raw)
+
 
 def main():
     if not SCRATCH:

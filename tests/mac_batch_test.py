@@ -565,6 +565,33 @@ def test_send_email_looks_up_sent_copy_without_db():
     check("confirmation carries id", result.endswith("(Sent Items id 777)"), result)
 
 
+def test_save_attachment_uses_posix_file_and_verifies_output():
+    log("--- save_attachment saves through a POSIX file reference ---")
+    with tempfile.TemporaryDirectory() as d:
+        class Writes(FakeBridge):
+            async def run(self, script, timeout=None):
+                self.scripts.append(script)
+                with open(os.path.join(d, "image003.png"), "wb") as fh:
+                    fh.write(b"\x89PNG fake")
+                return f"image003.png{DELIM}{d}/image003.png"
+
+        fake = Writes()
+        server_mac.bridge = fake
+        result = json.loads(asyncio.run(server_mac.save_attachment(entry_id="1", attachment_index=1, save_directory=d)))
+        script = fake.scripts[0]
+        check("only one script", len(fake.scripts) == 1)
+        check("save uses POSIX file", "save a in (POSIX file savePath)" in script, script)
+        check("no string-path save", "save a in savePath\n" not in script)
+        check("dead placeholder script gone", "__PLACEHOLDER__" not in script)
+        check("saved status", result.get("status") == "saved", str(result))
+        check("path returned", result.get("path") == os.path.join(d, "image003.png"), str(result))
+        check("byte count returned", result.get("bytes") == 9, str(result))
+
+        server_mac.bridge = FakeBridge(output=f"ghost.png{DELIM}{d}/ghost.png")
+        result = asyncio.run(server_mac.save_attachment(entry_id="1", attachment_index=1, save_directory=d))
+        check("missing file reported as error", result.startswith("Error saving attachment") and "ghost.png" in result, result)
+
+
 def main():
     server_mac._SENT_CONFIRM_TIMEOUT = 0.0  # unit tests never wait for Outlook's Sent Items write
     test_list_emails_uses_batch_script()
@@ -594,6 +621,7 @@ def main():
     test_get_event_reads_attendee_address_via_variable()
     test_reply_email_uses_dictionary_reply_command()
     test_send_email_looks_up_sent_copy_without_db()
+    test_save_attachment_uses_posix_file_and_verifies_output()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")
