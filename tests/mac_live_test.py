@@ -22,8 +22,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from outlook_desktop_mcp import server_mac, outlook_db
-from outlook_desktop_mcp.outlook_db import OutlookDB
+from outlook_desktop_mcp import server_mac
 
 SCRATCH = os.environ.get("OUTLOOK_MCP_LIVE_SCRATCH", "").strip()
 INLINE_ID = os.environ.get("OUTLOOK_MCP_LIVE_INLINE_ID", "").strip()
@@ -68,11 +67,9 @@ async def wait_for_count(folder, subject, minimum, timeout=ROUND_TRIP):
 
 
 async def start_server():
-    await server_mac.bridge.start()
-    path = outlook_db.locate()
-    if path and await server_mac._trust_db(OutlookDB(path)):
-        server_mac.db = OutlookDB(path)
-    log(f"  database: {'trusted' if server_mac.db else 'not used'}")
+    await server_mac.startup()
+    await server_mac._ensure_db()
+    log(f"  database: {server_mac._db_state}")
 
 
 async def run():

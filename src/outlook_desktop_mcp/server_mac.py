@@ -13,10 +13,11 @@ import json
 import logging
 import os
 import re
+import time
 
 from mcp.server.fastmcp import FastMCP
 
-from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
+from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge, STARTUP_TIMEOUT
 from outlook_desktop_mcp import outlook_db
 from outlook_desktop_mcp.outlook_db import OutlookDB, OutlookDBError
 from outlook_desktop_mcp.utils.applescript_helpers import (
@@ -67,10 +68,20 @@ mcp = FastMCP(
 
 bridge = AppleScriptBridge()
 
-# Read-only handle on legacy Outlook's profile database, set at startup
-# once _trust_db() has confirmed it is the store AppleScript is reading.
+# Read-only handle on legacy Outlook's profile database. Set only after
+# _ensure_db() has confirmed it is the store AppleScript is reading.
 # None means every tool uses AppleScript only.
 db: OutlookDB | None = None
+
+# Candidate database located at startup, and the trust decision for it:
+#   "none"      no database file found
+#   "unchecked" found; trust check not yet completed (retried on next use)
+#   "trusted"   check passed; `db` is set
+#   "untrusted" check failed (stale store or unusable file); never retried
+_db_candidate: OutlookDB | None = None
+_db_state = "none"
+_db_lock: asyncio.Lock | None = None
+_STARTED_AT = time.monotonic()
 
 # Startup trust check: the database inbox count may differ from
 # AppleScript's by this much (mail arriving while we check) and still be
@@ -80,12 +91,38 @@ _TRUST_DRIFT_MIN = 50
 _TRUST_DRIFT_FRACTION = 0.02
 
 
+async def _ensure_db() -> OutlookDB | None:
+    """Return the trusted database handle, running the trust check on first use.
+
+    The check needs one short AppleScript call. Outlook serialises scripts
+    across every client, so doing it at startup could stall past the MCP
+    client's connect timeout; doing it here keeps startup instant. A timeout
+    leaves the decision open for the next call; a real mismatch is final.
+    """
+    global db, _db_state, _db_lock
+    if db is not None or _db_candidate is None or _db_state != "unchecked":
+        return db
+    if _db_lock is None:
+        _db_lock = asyncio.Lock()
+    async with _db_lock:
+        if _db_state == "unchecked":
+            verdict = await _trust_db(_db_candidate)
+            if verdict is True:
+                db = _db_candidate
+                _db_state = "trusted"
+                logger.info("Using Outlook profile database for list/search: %s", db.path)
+            elif verdict is False:
+                _db_state = "untrusted"
+    return db
+
+
 async def _db_folder_id(folder: str) -> int | None:
     """Resolve a folder name via the profile database, or None if unavailable."""
-    if db is None:
+    handle = await _ensure_db()
+    if handle is None:
         return None
     try:
-        return await asyncio.to_thread(db.resolve_folder, folder)
+        return await asyncio.to_thread(handle.resolve_folder, folder)
     except OutlookDBError as e:
         logger.warning("Outlook database folder lookup failed; using AppleScript: %s", e)
         return None
@@ -104,7 +141,7 @@ async def _folder_ref(folder: str) -> str:
     return resolve_folder_ref(folder)
 
 
-async def _trust_db(candidate: OutlookDB) -> bool:
+async def _trust_db(candidate: OutlookDB) -> bool | None:
     """Confirm the database is the live store behind AppleScript.
 
     Asks AppleScript for the message count of the folder the database calls
@@ -126,9 +163,12 @@ async def _trust_db(candidate: OutlookDB) -> bool:
     return (name of f) & "{DELIM}" & ((count of messages of f) as text)
 end tell'''
     try:
-        raw = await bridge.run(script)
+        raw = await bridge.run(script, timeout=STARTUP_TIMEOUT)
         as_count = int(raw.rsplit(DELIM, 1)[-1].strip())
     except Exception as e:
+        if "timed out" in str(e):
+            logger.warning("Outlook database trust check timed out; will retry on next use")
+            return None
         logger.warning("Outlook database trust check failed (folder id %s): %s", fid, e)
         return False
     allowed = max(_TRUST_DRIFT_MIN, int(db_count * _TRUST_DRIFT_FRACTION))
@@ -310,6 +350,53 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
         })
 
     return results
+
+
+# =====================================================================
+# TOOL 0: ping
+# =====================================================================
+
+def _server_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("outlook-desktop-mcp")
+    except Exception:
+        return "unknown"
+
+
+@mcp.tool()
+async def ping() -> str:
+    """Check cheaply whether the server can reach Outlook.
+
+    Call this before starting a long task, or when another tool has stopped
+    answering. It runs one trivial AppleScript with a 10-second limit and
+    never raises.
+
+    Returns:
+        JSON with ok (bool), outlook_version, applescript_ms, db
+        ("trusted", "untrusted", "unchecked" or "none"), db_path,
+        server_version, uptime_s, and error when ok is false.
+    """
+    started = time.monotonic()
+    result = {
+        "ok": False,
+        "outlook_version": None,
+        "applescript_ms": None,
+        "db": _db_state,
+        "db_path": _db_candidate.path if _db_candidate is not None else None,
+        "server_version": _server_version(),
+        "uptime_s": int(time.monotonic() - _STARTED_AT),
+    }
+    try:
+        result["outlook_version"] = await bridge.run(
+            'tell application "Microsoft Outlook" to get version',
+            timeout=STARTUP_TIMEOUT,
+        )
+        result["ok"] = True
+    except Exception as e:
+        result["error"] = str(e)
+    result["applescript_ms"] = int((time.monotonic() - started) * 1000)
+    return json.dumps(result, indent=2)
 
 
 # =====================================================================
@@ -2171,22 +2258,27 @@ end tell'''
 # Entry point
 # =====================================================================
 
+async def startup() -> None:
+    """Verify Outlook answers and locate the profile database.
+
+    The database trust check is deferred to first use (see _ensure_db) so
+    startup never waits behind another client's AppleScript.
+    """
+    global _db_candidate, _db_state
+    logger.info("Starting Outlook Desktop MCP server (macOS)...")
+    await bridge.start()
+    path = outlook_db.locate()
+    if path is None:
+        logger.info("No Outlook profile database found; list/search use AppleScript")
+    else:
+        _db_candidate = OutlookDB(path)
+        _db_state = "unchecked"
+        logger.info("Outlook profile database found (trust check on first use): %s", path)
+    logger.info("AppleScript bridge ready. Starting MCP stdio transport...")
+
+
 def main():
-    import asyncio
-
-    async def _start():
-        global db
-        logger.info("Starting Outlook Desktop MCP server (macOS)...")
-        await bridge.start()
-        path = outlook_db.locate()
-        if path is None:
-            logger.info("No Outlook profile database found; list/search use AppleScript")
-        elif await _trust_db(OutlookDB(path)):
-            db = OutlookDB(path)
-            logger.info("Using Outlook profile database for list/search: %s", path)
-        logger.info("AppleScript bridge ready. Starting MCP stdio transport...")
-
-    asyncio.run(_start())
+    asyncio.run(startup())
     try:
         mcp.run(transport="stdio")
     finally:

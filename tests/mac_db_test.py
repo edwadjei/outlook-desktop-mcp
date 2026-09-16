@@ -14,6 +14,7 @@ import json
 import asyncio
 import sqlite3
 import tempfile
+import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -277,6 +278,11 @@ class FakeBridge:
         self.scripts = []
         self.output = output
 
+    async def start(self):
+        # Mirrors AppleScriptBridge.start(): one version probe under STARTUP_TIMEOUT.
+        await self.run('tell application "Microsoft Outlook" to get version',
+                       timeout=server_mac.STARTUP_TIMEOUT)
+
     async def run(self, script, timeout=None):
         self.scripts.append(script)
         return self.output
@@ -379,18 +385,15 @@ def test_server_folder_ref_uses_db_id():
 
 
 def test_server_trust_check():
-    log("--- startup trust check compares database inbox with AppleScript ---")
+    log("--- trust check compares database inbox with AppleScript ---")
     with tempfile.TemporaryDirectory() as d:
         db = OutlookDB(build_fixture(d))
-        # AppleScript agrees: folder 115 exists and has 4 messages.
         fake = FakeBridge(output="Inbox|||4")
         server_mac.bridge = fake
         check("agreeing counts -> trusted", asyncio.run(server_mac._trust_db(db)) is True)
         check("probe asks for folder id 115", "mail folder id 115" in fake.scripts[0])
-        # Small drift (mail arrived during startup) is fine.
         server_mac.bridge = FakeBridge(output="Inbox|||6")
         check("small drift -> trusted", asyncio.run(server_mac._trust_db(db)) is True)
-        # Stale legacy database: AppleScript sees a very different mailbox.
         server_mac.bridge = FakeBridge(output="Inbox|||900")
         check("large drift -> untrusted", asyncio.run(server_mac._trust_db(db)) is False)
 
@@ -401,6 +404,131 @@ def test_server_trust_check():
         server_mac.bridge = ErrBridge()
         check("folder id unknown to AppleScript -> untrusted",
               asyncio.run(server_mac._trust_db(db)) is False)
+
+        class SlowBridge(FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self.timeouts = []
+
+            async def run(self, script, timeout=None):
+                self.timeouts.append(timeout)
+                raise RuntimeError(f"AppleScript timed out after {timeout}s")
+
+        slow = SlowBridge()
+        server_mac.bridge = slow
+        check("AppleScript timeout -> undecided (None)", asyncio.run(server_mac._trust_db(db)) is None)
+        check("probe uses the startup timeout", slow.timeouts == [server_mac.STARTUP_TIMEOUT],
+              str(slow.timeouts))
+
+
+def _reset_db_state():
+    server_mac.db = None
+    server_mac._db_candidate = None
+    server_mac._db_state = "none"
+    server_mac._db_lock = None
+
+
+def test_server_trust_check_is_deferred_to_first_use():
+    log("--- trust check runs on first database use, not at startup ---")
+    with tempfile.TemporaryDirectory() as d:
+        path = build_fixture(d)
+        os.environ[outlook_db.ENV_VAR] = path
+        try:
+            _reset_db_state()
+
+            class VersionBridge(FakeBridge):
+                async def run(self, script, timeout=None):
+                    self.scripts.append(script)
+                    return "16.93.2"
+
+            vb = VersionBridge()
+            server_mac.bridge = vb
+            asyncio.run(server_mac.startup())
+            check("startup ran only the version probe", len(vb.scripts) == 1 and "version" in vb.scripts[0])
+            check("startup leaves db unset", server_mac.db is None)
+            check("state is unchecked", server_mac._db_state == "unchecked")
+
+            # First use: AppleScript busy -> timeout -> stays unchecked, tool still answers.
+            class SlowBridge(FakeBridge):
+                async def run(self, script, timeout=None):
+                    self.scripts.append(script)
+                    raise RuntimeError(f"AppleScript timed out after {timeout}s")
+
+            server_mac.bridge = SlowBridge()
+            fid = asyncio.run(server_mac._db_folder_id("inbox"))
+            check("timeout keeps state unchecked", server_mac._db_state == "unchecked")
+            check("no folder id while undecided", fid is None)
+
+            # Next use: AppleScript agrees -> trusted, and stays trusted.
+            server_mac.bridge = FakeBridge(output="Inbox|||4")
+            fid = asyncio.run(server_mac._db_folder_id("inbox"))
+            check("agreement -> trusted", server_mac._db_state == "trusted" and server_mac.db is not None)
+            check("folder id resolved from database", fid == 115)
+            server_mac.bridge = FakeBridge(output="Inbox|||900")
+            fid = asyncio.run(server_mac._db_folder_id("inbox"))
+            check("trusted verdict is cached", fid == 115 and len(server_mac.bridge.scripts) == 0)
+
+            # Mismatch on first use -> untrusted, cached, AppleScript not asked again.
+            _reset_db_state()
+            server_mac.bridge = VersionBridge()
+            asyncio.run(server_mac.startup())
+            bad = FakeBridge(output="Inbox|||900")
+            server_mac.bridge = bad
+            asyncio.run(server_mac._db_folder_id("inbox"))
+            check("mismatch -> untrusted", server_mac._db_state == "untrusted")
+            asyncio.run(server_mac._db_folder_id("inbox"))
+            check("untrusted verdict is cached", len(bad.scripts) == 1)
+        finally:
+            del os.environ[outlook_db.ENV_VAR]
+            _reset_db_state()
+
+
+def test_ping_tool():
+    log("--- ping reports Outlook reachability and database state ---")
+    _reset_db_state()
+    fake = FakeBridge(output="16.93.2")
+    server_mac.bridge = fake
+    result = json.loads(asyncio.run(server_mac.ping()))
+    check("ok when Outlook answers", result["ok"] is True, str(result))
+    check("reports version", result["outlook_version"] == "16.93.2")
+    check("reports db state", result["db"] == "none")
+    check("reports uptime", isinstance(result["uptime_s"], int))
+    check("reports server version", isinstance(result["server_version"], str) and result["server_version"])
+    check("applescript_ms measured", isinstance(result["applescript_ms"], int))
+
+    class DeadBridge(FakeBridge):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        async def run(self, script, timeout=None):
+            self.timeouts.append(timeout)
+            raise RuntimeError("AppleScript timed out after 10s")
+
+    dead = DeadBridge()
+    server_mac.bridge = dead
+    result = json.loads(asyncio.run(server_mac.ping()))
+    check("not ok when Outlook is silent", result["ok"] is False)
+    check("error carried", "timed out" in result.get("error", ""))
+    check("ping uses the short startup timeout", dead.timeouts == [server_mac.STARTUP_TIMEOUT])
+    names = [t.name for t in asyncio.run(server_mac.mcp.list_tools())]
+    check("ping is registered as a tool", "ping" in names)
+
+
+def test_query_deadline_interrupts_long_query():
+    log("--- a query past the deadline is interrupted and raises OutlookDBError ---")
+    with tempfile.TemporaryDirectory() as d:
+        db = OutlookDB(build_fixture(d), timeout=0.2)
+        t0 = time.time()
+        try:
+            db._query("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
+                      "SELECT COUNT(*) FROM c")
+            check("raised OutlookDBError", False, "query finished")
+        except outlook_db.OutlookDBError as e:
+            check("raised OutlookDBError", "exceeded" in str(e), str(e))
+        check("returned promptly", time.time() - t0 < 2.0, f"{time.time() - t0:.2f}s")
+        check("normal query still works", db.resolve_folder("inbox") == 115)
+    check("default deadline is 20s", outlook_db.DB_TIMEOUT == 20.0, str(outlook_db.DB_TIMEOUT))
 
 
 def main():
@@ -425,6 +553,9 @@ def main():
     test_server_no_db_uses_applescript()
     test_server_folder_ref_uses_db_id()
     test_server_trust_check()
+    test_server_trust_check_is_deferred_to_first_use()
+    test_ping_tool()
+    test_query_deadline_interrupts_long_query()
 
     log("=" * 50)
     log(f"{passed}/{total} checks passed")

@@ -16,6 +16,7 @@ import glob
 import logging
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from urllib.parse import quote
@@ -57,6 +58,22 @@ _LIVE_ROWS = "IFNULL(Message_MarkedForDelete, 0) = 0"
 _BUSY_RETRIES = 3
 
 
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %ss", name, raw, default)
+    return default
+
+
+# Deadline for one SQL query. A query that runs past it is interrupted and
+# reported as OutlookDBError so the caller falls back to AppleScript instead
+# of hanging the tool call.
+DB_TIMEOUT = _env_seconds("OUTLOOK_MCP_DB_TIMEOUT", 20)
+
+
 class OutlookDBError(RuntimeError):
     """The profile database is unusable (missing tables, locked, corrupt)."""
 
@@ -96,11 +113,20 @@ def _iso(ts) -> str:
         return ""
 
 
+def _interrupt(con: sqlite3.Connection) -> None:
+    """Timer callback: abort the running statement on this connection."""
+    try:
+        con.interrupt()
+    except sqlite3.ProgrammingError:
+        pass  # connection already closed
+
+
 class OutlookDB:
     """Read-only queries against one Outlook profile database."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, timeout: float = DB_TIMEOUT):
         self.path = path
+        self.timeout = timeout
 
     def _connect(self) -> sqlite3.Connection:
         uri = f"file:{quote(self.path)}?mode=ro"
@@ -111,14 +137,20 @@ class OutlookDB:
     def _query(self, sql: str, params=()) -> list[sqlite3.Row]:
         last = None
         for attempt in range(_BUSY_RETRIES):
+            con = None
+            timer = None
             try:
                 con = self._connect()
-                try:
-                    return con.execute(sql, params).fetchall()
-                finally:
-                    con.close()
+                timer = threading.Timer(self.timeout, _interrupt, (con,))
+                timer.daemon = True
+                timer.start()
+                return con.execute(sql, params).fetchall()
             except sqlite3.OperationalError as e:
                 msg = str(e).lower()
+                if "interrupted" in msg:
+                    raise OutlookDBError(
+                        f"Outlook database query exceeded {self.timeout:g}s"
+                    ) from e
                 if "locked" in msg or "busy" in msg:
                     last = e
                     time.sleep(0.2 * (attempt + 1))
@@ -126,6 +158,11 @@ class OutlookDB:
                 raise OutlookDBError(f"Outlook database query failed: {e}") from e
             except sqlite3.DatabaseError as e:
                 raise OutlookDBError(f"Outlook database unusable: {e}") from e
+            finally:
+                if timer is not None:
+                    timer.cancel()
+                if con is not None:
+                    con.close()
         raise OutlookDBError(f"Outlook database busy: {last}")
 
     # --- folders -------------------------------------------------------

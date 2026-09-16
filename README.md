@@ -115,6 +115,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 |------|:-------:|:-----:|-------------|
 | `send_email` | yes | yes | Send an email with To/CC/BCC; `html_body` recommended, plain `body` auto-converted to HTML |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
+| `ping` | no | yes | Liveness check: Outlook version, AppleScript round-trip time, database state; answers within 10 s |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
 | `search_emails` | yes | yes | Full-text search across email subjects and bodies (macOS: subject, sender, and preview via the local message index) |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread; accepts `html_body` |
@@ -205,6 +206,8 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 - Search uses AppleScript's `whose` clause (e.g. `messages whose subject contains "query"`) instead of DASL filters, unless the local message index is available (see below).
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
 - Dates passed to AppleScript are built by component assignment (`set year of d to 2026`, ...) rather than `date "..."` literals, which osascript parses according to the system locale and can silently turn `"2026-09-01 07:00"` into a date in 2007.
+
+**Every call is bounded.** Each AppleScript runs under `OUTLOOK_MCP_SCRIPT_TIMEOUT` (default 120 s) and each profile-database query under `OUTLOOK_MCP_DB_TIMEOUT` (default 20 s); a query past its deadline is interrupted and the tool falls back to AppleScript. A list or search call therefore never runs longer than about 260 s (database, batched script, legacy script), and most finish in well under a second. The database trust check runs on the first list or search call rather than at startup, so the server connects instantly even when Outlook is busy serving another client's script. Use `ping` to confirm Outlook is answering before a long task.
 
 #### Fast list and search on macOS (`outlook_db.py`)
 
