@@ -124,3 +124,13 @@ suites waits the full 10 s — cost if wrong: none (an explicit timing test cove
 - Deferred minors: (1) the "using AppleScript" warning is misleading when filters are given
   (an error is returned instead); (2) README now has two adjacent bullets on what search matches;
   (3) query clause uses bare sender columns while the sender clause wraps them in IFNULL.
+
+### Task 5 — save_attachment saves inline images
+- BASE 52cf125 → HEAD 3a76990. Implementer (fresh) DONE; live run 16/16 including the inline save
+  from message 197468. The brief's predicted RED failure on the placeholder check did not occur
+  because the dead script never reached the bridge; the check stays as a regression guard.
+- Reviewer (fresh): SPEC PASS, CODE PASS. Independently: gate 140/140, 118/118; real save of
+  attachment 2 of 197468 → valid 1057×391 PNG, 27,315 bytes.
+- Deferred minors: (1) an attachment name containing "/" or "../" is used unsanitised in both the
+  AppleScript path and the Python join; (2) `getsize` called twice; (3) unreachable `"unknown"`
+  branch.
