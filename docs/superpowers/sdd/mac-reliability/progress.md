@@ -113,3 +113,14 @@ suites waits the full 10 s — cost if wrong: none (an explicit timing test cove
 - Fix round 2 (b844fa6): subject read into `sentSubject` before `send`. Re-review: ADDRESSED, no
   new findings. Task 3 closed at b844fa6 (three commits: b3541d0, 4d5b9dd, b844fa6). Reply path
   changed after the live run; the close-out live run covers it.
+
+### Task 4 — search_emails by recipient and sender
+- BASE 8380a2f → HEAD 1f14d0a. Implementer (fresh) DONE; deviations: `_reset_db_state()` bracketing
+  in the server test (requested at dispatch); gate run after the README edit.
+- Reviewer (fresh): SPEC PASS, CODE PASS. Independently: gate 132/132, 118/118; real inbox
+  (33,070 rows): `recipient="edward"` returns the previously missed request 197678 in 3.6 ms;
+  `query="approv"` alone still misses it because "approv" is not in its 255-character preview,
+  which is exactly the documented limit; LIKE escaping verified live with `%`, `_`, `\`.
+- Deferred minors: (1) the "using AppleScript" warning is misleading when filters are given
+  (an error is returned instead); (2) README now has two adjacent bullets on what search matches;
+  (3) query clause uses bare sender columns while the sender clause wraps them in IFNULL.
