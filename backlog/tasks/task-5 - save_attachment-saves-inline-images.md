@@ -1,9 +1,10 @@
 ---
 id: TASK-5
 title: save_attachment saves inline images
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-09-16 08:26'
+updated_date: '2026-09-16 09:06'
 labels:
   - macos
   - bug
