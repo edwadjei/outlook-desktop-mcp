@@ -134,3 +134,37 @@ suites waits the full 10 s — cost if wrong: none (an explicit timing test cove
 - Deferred minors: (1) an attachment name containing "/" or "../" is used unsanitised in both the
   AppleScript path and the Python join; (2) `getsize` called twice; (3) unreachable `"unknown"`
   branch.
+
+## Close-out
+
+### Final whole-branch review (fresh reviewer, a96510c..7092c33)
+- Spec coverage complete; one deliberate deviation from spec §4 text (filters return an error on the
+  fallback instead of a `note`), recorded as a ruling; spec text to be amended in a follow-up.
+- Cross-task seams checked: `_sent_copy_id` over the lazy trust check is safe (nothing escapes
+  `_trust_db`); ping reflects state correctly; test isolation holds; live probe: startup 0.13 s,
+  ping 40 ms, first list 1.2 s → trusted, filtered search 3 ms.
+- Commit hygiene: 18 commits, all edwadjei <edd.net49@gmail.com>, no AI references, no trailers.
+- Must-fix: README still says the trust check runs "at startup"; search table row reads as
+  cross-platform; two overlapping search bullets. Doc-only.
+- Triage of deferred minors: accept — T1(1)(2)(3), T2(1)(2)(4)(5), T3(5), T4(1)(2)(3), T5(2)(3).
+  Follow-up — T2(3) serialised 10 s re-probes under a busy Outlook; T3(2)(3)(4) `_sent_copy_id`
+  hardening (unresolvable sent folder, unvalidated fallback id, local-time assumption on
+  `Message_TimeReceived`); T5(1) attachment-name sanitising; N2 a transient busy/interrupted
+  probe is cached as untrusted for the process lifetime; N3 amend spec §4 text; N4 the AppleScript
+  sent-copy fallback has never run live.
+- Rulings: reviewer would reverse none; recommends amending "mismatch or unusable is final" so a
+  busy/interrupted probe returns None (folded into follow-up N2).
+- Ruling: untracked task-*-diff.patch files are deleted at close-out — they are reproducible from
+  the commit ranges recorded in this ledger — cost if wrong: none.
+- Verdict: READY once the README fix lands.
+
+### Fix wave and final gate
+- Fix wave (92ca39c, README only): re-review ADDRESSED ×3, no content lost. Must-fix list empty.
+- Final gate on 92ca39c: tests/mac_batch_test.py 140/140 (118 at start), tests/mac_db_test.py
+  118/118 (68 at start), wheel builds. Live end-to-end run 16/16 (seed, reply, reply-all, each
+  confirmed by Sent Items id and read_email; inline image saved from 197468).
+- Follow-up cards created: task-6 (trust-check resilience), task-7 (_sent_copy_id hardening),
+  task-8 (attachment-name sanitising), task-9 (spec §4 amendment).
+- Diff packages deleted (reproducible from the ranges above). Package reinstalled into
+  ~/.mcp-venvs/outlook-desktop from this worktree at 92ca39c.
+- Integration decision left to the owner: merge locally / push and open a PR / keep the branch.
