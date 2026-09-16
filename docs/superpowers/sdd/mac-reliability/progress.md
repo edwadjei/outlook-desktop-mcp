@@ -62,3 +62,15 @@ Ruling: unit test mains set `_SENT_CONFIRM_TIMEOUT = 0` — otherwise every send
 suites waits the full 10 s — cost if wrong: none (an explicit timing test covers the wait).
 
 ## Task log
+
+### Task 1 — reply_email dictionary command; live test
+- BASE 096d540 → HEAD f04de6c. Implementer (fresh) DONE_WITH_CONCERNS: corrected a pre-existing
+  check (tests/mac_batch_test.py:321) that asserted the invented `reply all to m`; accepted.
+- Reviewer (fresh): SPEC PASS, CODE PASS. Gate verified independently 126/126, 68/68; live run
+  verified in the profile database (Sent Items ids 197807, 197810, 197812).
+- Deferred minors: (1) live test's Re:-insensitive matching exists only on the database path; on
+  the AppleScript fallback the reply checks would false-FAIL — carry to Task 3/5 (assert the database
+  is trusted up front or strip prefixes); (2) reply_all True/False indistinguishable in assertions;
+  (3) a poll on the AppleScript fallback can overrun ROUND_TRIP by up to 243 s (bounded).
+- Live test left three "Safe to delete" messages in the test mailbox (subject
+  `[MCP live test 2026-09-16 08:28:59] reply regression`).
