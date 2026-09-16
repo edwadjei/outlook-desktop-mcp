@@ -1,9 +1,10 @@
 ---
 id: TASK-1
 title: 'reply_email: use dictionary reply-to command; live send/reply test'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-09-16 08:26'
+updated_date: '2026-09-16 08:26'
 labels:
   - macos
   - bug
