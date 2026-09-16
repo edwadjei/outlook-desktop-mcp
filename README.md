@@ -116,7 +116,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `send_email` | yes | yes | Send an email with To/CC/BCC; `html_body` recommended, plain `body` auto-converted to HTML |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies |
+| `search_emails` | yes | yes | Full-text search across email subjects and bodies (macOS: subject, sender, and preview via the local message index) |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread; accepts `html_body` |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
@@ -202,9 +202,29 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 
 - Entry IDs on macOS are **numeric** (e.g. `42`), not hex strings. They identify items within their folder context.
 - Folder references use AppleScript's **locale-independent keywords** (`inbox`, `sent items`, `drafts`, `deleted items`) rather than localized folder names.
-- Search uses AppleScript's `whose` clause (e.g. `messages whose subject contains "query"`) instead of DASL filters.
+- Search uses AppleScript's `whose` clause (e.g. `messages whose subject contains "query"`) instead of DASL filters, unless the local message index is available (see below).
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
 - Dates passed to AppleScript are built by component assignment (`set year of d to 2026`, ...) rather than `date "..."` literals, which osascript parses according to the system locale and can silently turn `"2026-09-01 07:00"` into a date in 2007.
+
+#### Fast list and search on macOS (`outlook_db.py`)
+
+AppleScript's `whose` clause makes Outlook walk every message in the folder, one Apple Event at a time. On a mailbox with tens of thousands of messages a single search exceeds the script timeout, and because Outlook runs one script at a time it stalls every other tool while it runs. Legacy Outlook for Mac keeps all message metadata in a SQLite database under its profile directory, and its AppleScript layer reads from that same store, so the numeric `Record_RecordID` in the database is exactly the `id` AppleScript uses.
+
+`list_emails` and `search_emails` therefore query that database directly, read-only:
+
+- Listing and searching a 33,000-message inbox takes milliseconds instead of minutes.
+- Search matches subject, sender name, sender address, and the message preview, and ignores `Re:`/`FW:` prefixes (the database stores a normalized subject, so results show the subject without those prefixes).
+- Folder names are resolved through the database's folder table, which also fixes the `inbox` keyword resolving to the empty local "On My Computer" store on Exchange profiles; action tools then address folders by id.
+- The ids returned are the same ones `read_email`, `reply_email`, `move_email`, and the mark tools use through AppleScript.
+
+Safety and fallback:
+
+- The database is opened with `mode=ro`; nothing is ever written, and reads never block Outlook.
+- At startup the server asks AppleScript for the message count of the folder the database calls the inbox. If the id is unknown to AppleScript or the counts diverge (a stale database left behind after switching to New Outlook), the database is not used.
+- If the database is missing (New Outlook, no profile yet), busy, or has an unexpected schema, or a folder name is not found in it, the tool falls back to the AppleScript path above. Search then matches subject only.
+- `OUTLOOK_MCP_DB_PATH` overrides the database location. The default is `~/Library/Group Containers/UBF8T346G9.Office/Outlook/Outlook 15 Profiles/<profile>/Data/Outlook.sqlite`, preferring `Main Profile`.
+
+`python tests/mac_db_test.py` covers the database layer and its integration against a fixture database, without Outlook.
 
 #### Email bodies on macOS
 
@@ -317,6 +337,7 @@ outlook-desktop-mcp/
     server_mac.py            # macOS MCP server (22 tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
+    outlook_db.py            # Read-only Outlook profile database queries (macOS)
     tools/
       _folder_constants.py   # Outlook enums and constants (Windows)
     utils/
@@ -330,6 +351,8 @@ outlook-desktop-mcp/
     calendar_mcp_test.py     # Calendar MCP test
     extras_com_test.py       # Tasks/attachments/categories/rules/OOF COM test
     extras_mcp_test.py       # Tasks/attachments/categories/rules/OOF MCP test
+    mac_batch_test.py        # macOS batched AppleScript generation (no Outlook needed)
+    mac_db_test.py           # macOS profile database layer (no Outlook needed)
   outlook-desktop-mcp.cmd   # Windows launcher script
   pyproject.toml
 ```
